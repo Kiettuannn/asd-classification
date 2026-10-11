@@ -1,0 +1,40 @@
+# Python environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Neuroimaging and dataset files
+*.nii
+*.nii.gz
+*.1D
+*.part
+data/ABIDE_pcp/
+notebook/data/
+notebook/abide_data/
+**/ABIDE_pcp/
+*.csv
+*.tsv
+*.h5
+*.npy
+*.npz
+*.pt
+*.pth
+*.pkl
+*.parquet
+
+# OS specific
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,10 @@
+[project]
+name = "asd-classification"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.11.2",
+    "nilearn>=0.14.1",
+    "seaborn>=0.13.2",
+]
