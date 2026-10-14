@@ -1,0 +1,39 @@
+[project]
+name = "asd-classification"
+version = "0.1.0"
+description = "Machine learning and graph neural network pipeline for Autism Spectrum Disorder (ASD) classification from rs-fMRI"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "typer>=0.9.0",
+    "scikit-learn>=1.3.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "nilearn>=0.10.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "joblib>=1.3.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+]
+gnn = [
+    "torch>=2.0.0",
+    "torch-geometric>=2.3.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "ipykernel>=6.29.0",
+    "httpx2>=2.13.1",
+]
+
+[project.scripts]
+asd = "asd_classification.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
