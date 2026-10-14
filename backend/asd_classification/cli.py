@@ -41,7 +41,7 @@ if app is not None:
         typer.echo(f"Starting FastAPI server on {host}:{port}...")
         try:
             import uvicorn
-            uvicorn.run("src.api.app:create_app", factory=True, host=host, port=port, reload=True)
+            uvicorn.run("asd_classification.api.app:create_app", factory=True, host=host, port=port, reload=True)
         except ImportError:
             typer.echo("Uvicorn/FastAPI not installed. Please run: pip install '.[api]'")
 

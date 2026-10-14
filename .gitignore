@@ -21,8 +21,8 @@ __pycache__/
 *.1D
 *.part
 data/ABIDE_pcp/
-notebook/data/
-notebook/abide_data/
+notebooks/data/
+notebooks/abide_data/
 **/ABIDE_pcp/
 *.csv
 *.tsv

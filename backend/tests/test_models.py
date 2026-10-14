@@ -1,9 +1,9 @@
 """Tests for model architectures and base interfaces."""
 
-from src.models.base import BaseBrainModel
-from src.models.baseline.svm import SVMClassifier
-from src.models.gnn.gcn import BrainGCN
-from src.models.gnn.gat import BrainGAT
+from asd_classification.models.base import BaseBrainModel
+from asd_classification.models.baseline.svm import SVMClassifier
+from asd_classification.models.gnn.gcn import BrainGCN
+from asd_classification.models.gnn.gat import BrainGAT
 
 
 def test_model_hierarchy():

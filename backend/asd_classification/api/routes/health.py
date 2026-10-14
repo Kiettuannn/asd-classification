@@ -1,7 +1,7 @@
 """Health check endpoint."""
 
 from typing import Any
-from src.api.schemas import HealthResponse
+from asd_classification.api.schemas import HealthResponse
 
 try:
     from fastapi import APIRouter

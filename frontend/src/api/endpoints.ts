@@ -1,7 +1,7 @@
 /**
  * Centralized API endpoint dictionary.
  * All backend route paths are defined here and imported by feature hooks/api modules.
- * @see src/api/routes/ for corresponding FastAPI route handlers.
+ * @see backend/asd_classification/api/routes/ for corresponding FastAPI route handlers.
  */
 export const ENDPOINTS = {
   /** GET /health – service status and loaded model info */

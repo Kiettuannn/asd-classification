@@ -1,6 +1,6 @@
 """Model explainability & salient brain connections endpoint."""
 
-from src.api.schemas import ExplainResponse
+from asd_classification.api.schemas import ExplainResponse
 
 try:
     from fastapi import APIRouter, HTTPException

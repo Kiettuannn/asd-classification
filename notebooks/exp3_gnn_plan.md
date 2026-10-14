@@ -534,7 +534,7 @@ visualize_attention(model_gat, graph_dataset, idx=asd_idx, top_k=20)
 
 ```
 asd-classification/
-├── notebook/
+├── notebooks/
 │   └── ASD_SVM_Pipeline.ipynb          ← Phase 1 (đã xong)
 ├── exp3_gnn/
 │   ├── 01_data_preparation.ipynb       ← Step 2, 3

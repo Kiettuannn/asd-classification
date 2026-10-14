@@ -1,7 +1,7 @@
 """Tests for feature extraction and graph construction."""
 
 import pytest
-from src.features.connectivity import compute_fc, vectorize_fc, threshold_fc
+from asd_classification.features.connectivity import compute_fc, vectorize_fc, threshold_fc
 
 
 def test_feature_interface_definitions():

@@ -1,12 +1,12 @@
 """FastAPI application factory and middleware configuration."""
 
 from typing import Any
-from src.config.settings import get_settings
+from asd_classification.config.settings import get_settings
 
 try:
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from src.api.routes import health_router, predict_router, explain_router
+    from asd_classification.api.routes import health_router, predict_router, explain_router
 
     def create_app() -> FastAPI:
         """Constructs and configures the FastAPI application."""

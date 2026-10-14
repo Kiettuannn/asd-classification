@@ -1,6 +1,6 @@
 """Inference prediction endpoint."""
 
-from src.api.schemas import PredictRequest, PredictResponse
+from asd_classification.api.schemas import PredictRequest, PredictResponse
 
 try:
     from fastapi import APIRouter, HTTPException

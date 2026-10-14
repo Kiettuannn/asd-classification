@@ -2,7 +2,6 @@
 name = "asd-classification"
 version = "0.1.0"
 description = "Machine learning and graph neural network pipeline for Autism Spectrum Disorder (ASD) classification from rs-fMRI"
-readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.5.0",
@@ -29,10 +28,11 @@ gnn = [
 dev = [
     "pytest>=8.0.0",
     "ipykernel>=6.29.0",
+    "httpx2>=2.13.1",
 ]
 
 [project.scripts]
-asd = "src.cli:app"
+asd = "asd_classification.cli:app"
 
 [build-system]
 requires = ["hatchling"]

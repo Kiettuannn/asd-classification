@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import numpy as np
 
-from src.models.base import BaseBrainModel
+from asd_classification.models.base import BaseBrainModel
 
 
 class SVMClassifier(BaseBrainModel):

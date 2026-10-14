@@ -19,12 +19,11 @@ except ImportError:
 class Settings(BaseSettings):
     """Central configuration for datasets, features, models, and API."""
 
-    # Project Directories
-    BASE_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent.parent)
-    
-    @property
-    def DATA_DIR(self) -> Path:
-        return self.BASE_DIR / "data"
+    # Application and shared research directories
+    BACKEND_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
+    REPOSITORY_ROOT: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3])
+    DATA_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3] / "data")
+    ARTIFACTS_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3] / "artifacts")
 
     @property
     def RAW_ABIDE_DIR(self) -> Path:
@@ -33,10 +32,6 @@ class Settings(BaseSettings):
     @property
     def PROCESSED_DATA_DIR(self) -> Path:
         return self.DATA_DIR / "processed"
-
-    @property
-    def ARTIFACTS_DIR(self) -> Path:
-        return self.BASE_DIR / "artifacts"
 
     @property
     def MODELS_DIR(self) -> Path:

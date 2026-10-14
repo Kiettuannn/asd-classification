@@ -1,6 +1,6 @@
 """Root entrypoint for the ASD Classification application."""
 
-from src.cli import main
+from asd_classification.cli import main
 
 if __name__ == "__main__":
     main()

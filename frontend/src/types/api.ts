@@ -1,6 +1,6 @@
 /**
  * TypeScript interfaces mirroring the backend FastAPI Pydantic schemas.
- * @see src/api/schemas.py
+ * @see backend/asd_classification/api/schemas.py
  */
 
 /** Health check response from GET /api/v1/health */

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import numpy as np
 
-from src.config.settings import get_settings
+from asd_classification.config.settings import get_settings
 
 
 def run_training_pipeline(
