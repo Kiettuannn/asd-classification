@@ -38,3 +38,8 @@ notebook/abide_data/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Frontend dependencies, builds, and local environment overrides
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
