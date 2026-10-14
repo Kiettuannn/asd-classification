@@ -16,14 +16,18 @@ except ImportError:
             pass
 
 
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = BACKEND_DIR.parent
+
+
 class Settings(BaseSettings):
     """Central configuration for datasets, features, models, and API."""
 
     # Application and shared research directories
-    BACKEND_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
-    REPOSITORY_ROOT: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3])
-    DATA_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3] / "data")
-    ARTIFACTS_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3] / "artifacts")
+    BACKEND_DIR: Path = BACKEND_DIR
+    REPOSITORY_ROOT: Path = REPOSITORY_ROOT
+    DATA_DIR: Path = REPOSITORY_ROOT / "data"
+    ARTIFACTS_DIR: Path = REPOSITORY_ROOT / "artifacts"
 
     @property
     def RAW_ABIDE_DIR(self) -> Path:
