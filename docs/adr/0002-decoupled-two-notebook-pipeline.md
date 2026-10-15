@@ -1,0 +1,3 @@
+# Decoupled Two-Notebook Architecture for Kaggle Execution
+
+We decided to decouple preprocessing and model training into two distinct Kaggle notebooks linked via a dataset artifact. Notebook 1 downloads raw/preprocessed neuroimaging volumes from ABIDE I, extracts 50 middle slices across the axial, coronal, and sagittal planes, resizes slices to 224x224, and exports compressed multi-view tensors along with a subject-level 80/20 train/test split manifest (`metadata.csv`). Notebook 2 attaches Notebook 1's output as an input Kaggle Dataset and performs model training, evaluation, and logging without repeating heavy neuroimaging I/O.
