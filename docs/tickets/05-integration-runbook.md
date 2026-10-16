@@ -8,10 +8,10 @@ Implement an end-to-end integration test and Kaggle execution runbook. The integ
 
 ## Acceptance criteria
 
-- [ ] Automated integration test verifies the contract between Notebook 1's exported `metadata.csv` / tensor files and Notebook 2's dataset reader.
-- [ ] A mock/smoke training execution runs for 1 epoch on CPU/GPU without errors or memory leaks.
-- [ ] Reproducibility runbook document detailing Kaggle environment configuration, GPU accelerator activation, dataset mounting, and execution sequence.
-- [ ] Verification checklist comparing executed run outputs against published Table 8 metrics (Accuracy ~81.24%, F1 ~79.63%).
+- [x] Automated integration test verifies the contract between Notebook 1's exported `metadata.csv` / tensor files and Notebook 2's dataset reader.
+- [x] A mock/smoke training execution runs for 1 epoch on CPU/GPU without errors or memory leaks.
+- [x] Reproducibility runbook document detailing Kaggle environment configuration, GPU accelerator activation, dataset mounting, and execution sequence.
+- [x] Verification checklist comparing executed run outputs against published Table 8 metrics (Accuracy ~81.24%, F1 ~79.63%).
 
 ## Blocked by
 
