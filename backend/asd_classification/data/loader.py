@@ -2,9 +2,11 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 
 @dataclass
@@ -145,3 +147,115 @@ class ABIDELoader:
             )
         labels = df["dx_group"].to_numpy()
         return records, np.empty((len(records), 0)), labels
+
+
+class MultiViewDataset(Dataset):
+    """PyTorch Dataset for depth-stacked multi-view fMRI volumetric tensors.
+
+    Loads preprocessed multi-view tensors of shape (1, 150, 224, 224) from compressed
+    .npz archives and associates them with binary diagnostic labels (1=ASD, 0=TC)
+    from metadata.csv.
+    """
+
+    def __init__(
+        self,
+        manifest: Union[pd.DataFrame, str, Path],
+        tensors_dir: Optional[Union[str, Path]] = None,
+        split: Optional[str] = None,
+        transform: Optional[Any] = None,
+    ) -> None:
+        """Initialize MultiViewDataset.
+
+        Args:
+            manifest: DataFrame or path to metadata.csv containing subject records and splits.
+            tensors_dir: Optional root directory containing .npz tensor files.
+            split: Optional split filter: 'train', 'test', or None/'all'.
+            transform: Optional volume-consistent transformation module.
+        """
+        self._manifest_dir: Optional[Path]
+        if isinstance(manifest, (str, Path)):
+            manifest_path = Path(manifest)
+            self.manifest_df = pd.read_csv(manifest_path)
+            self._manifest_dir = manifest_path.parent
+        elif isinstance(manifest, pd.DataFrame):
+            self.manifest_df = manifest.copy()
+            self._manifest_dir = None
+        else:
+            raise TypeError(f"Expected DataFrame or path, got {type(manifest)}")
+
+        # Filter by split if requested
+        if split is not None and split.lower() not in ("all", "none"):
+            if "split" not in self.manifest_df.columns:
+                raise ValueError("Cannot filter by split when 'split' column is not in manifest.")
+            self.manifest_df = self.manifest_df[
+                self.manifest_df["split"] == split.lower()
+            ].reset_index(drop=True)
+        else:
+            self.manifest_df = self.manifest_df.reset_index(drop=True)
+
+        self.tensors_dir = Path(tensors_dir) if tensors_dir is not None else None
+        self.split = split
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.manifest_df)
+
+    def _resolve_tensor_file(self, row: pd.Series) -> Path:
+        sub_id = str(row["subject_id"])
+        tensor_path_str = str(row.get("tensor_path", ""))
+
+        candidates = []
+        if self.tensors_dir is not None:
+            if tensor_path_str:
+                candidates.append(self.tensors_dir / tensor_path_str)
+                # If tensor_path is "tensors/50001.npz" and tensors_dir is already ".../tensors":
+                candidates.append(self.tensors_dir / Path(tensor_path_str).name)
+            candidates.append(self.tensors_dir / f"{sub_id}.npz")
+            candidates.append(self.tensors_dir / "tensors" / f"{sub_id}.npz")
+
+        if tensor_path_str:
+            candidates.append(Path(tensor_path_str))
+            if self._manifest_dir is not None:
+                candidates.append(self._manifest_dir / tensor_path_str)
+
+        # Standard Kaggle and project input locations
+        kaggle_base = Path("/kaggle/input/abide-i-nyu-multiview-fmri")
+        candidates.extend([
+            kaggle_base / "tensors" / f"{sub_id}.npz",
+            kaggle_base / tensor_path_str if tensor_path_str else kaggle_base / f"{sub_id}.npz",
+            Path("/kaggle/working/abide_nyu_multiview/tensors") / f"{sub_id}.npz",
+            Path("output/abide_nyu_multiview/tensors") / f"{sub_id}.npz",
+            Path("../output/abide_nyu_multiview/tensors") / f"{sub_id}.npz",
+        ])
+
+        for c in candidates:
+            if c and c.is_file():
+                return c
+
+        raise FileNotFoundError(
+            f"Could not locate tensor file for subject {sub_id}. "
+            f"Checked locations: {[str(c) for c in candidates[:4]]}"
+        )
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        row = self.manifest_df.iloc[idx]
+        file_path = self._resolve_tensor_file(row)
+
+        with np.load(file_path) as npz:
+            tensor_np = npz["tensor"]
+
+        tensor = torch.from_numpy(tensor_np).float()
+        # Ensure single channel dimension (1, D, H, W)
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+
+        if self.transform is not None:
+            tensor = self.transform(tensor)
+            if not isinstance(tensor, torch.Tensor):
+                tensor = torch.from_numpy(tensor).float()
+
+        label = int(row["dx_group"])
+        return tensor, torch.tensor(label, dtype=torch.long)
+
+    def get_labels(self) -> np.ndarray:
+        return self.manifest_df["dx_group"].to_numpy(dtype=np.int64)

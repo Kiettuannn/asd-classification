@@ -8,13 +8,13 @@ Implement the complete, standalone training and evaluation Jupyter notebook for 
 
 ## Acceptance criteria
 
-- [ ] Self-contained Jupyter notebook running smoothly on Kaggle GPU (T4 / P100) with mixed precision (`torch.amp.autocast`).
-- [ ] Correctly loads `metadata.csv` and multi-view tensor inputs from Kaggle dataset input paths.
-- [ ] Applies volume-consistent augmentation during training and disables augmentation during validation/testing.
-- [ ] Implements training loop with physical batch size 2 and gradient accumulation 4 steps (effective batch size 8).
-- [ ] Evaluates against the 80/20 test split (15 ASD, 21 TC) and reports Accuracy, Precision, Recall, F1-Score, and Focal Loss.
-- [ ] Generates and saves an ROC curve plot with AUC score to `/kaggle/working/roc_curve.png`.
-- [ ] Provides an optional flag to run stratified 5-fold cross-validation across all 184 subjects.
+- [x] Self-contained Jupyter notebook running smoothly on Kaggle GPU (T4 / P100) with mixed precision (`torch.amp.autocast`).
+- [x] Correctly loads `metadata.csv` and multi-view tensor inputs from Kaggle dataset input paths.
+- [x] Applies volume-consistent augmentation during training and disables augmentation during validation/testing.
+- [x] Implements training loop with physical batch size 2 and gradient accumulation 4 steps (effective batch size 8).
+- [x] Evaluates against the 80/20 test split (15 ASD, 21 TC) and reports Accuracy, Precision, Recall, F1-Score, and Focal Loss.
+- [x] Generates and saves an ROC curve plot with AUC score to `/kaggle/working/roc_curve.png`.
+- [x] Provides an optional flag to run stratified 5-fold cross-validation across all 184 subjects.
 
 ## Blocked by
 

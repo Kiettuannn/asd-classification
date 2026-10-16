@@ -1,32 +1,428 @@
-"""Orchestrates end-to-end model training with Stratified K-Fold Cross Validation."""
+"""Training workflows, mixed-precision optimization, and cross-validation pipelines.
+
+Implements the mixed-precision training pipeline for Baseline 3D-CNN from
+Hammash & Younis (MDPI Journal of Imaging, 2026, 12, 109) with:
+- Adam optimizer (learning rate 1e-5, L2 weight decay 0.0005)
+- Physical batch size 2, gradient accumulation 4 steps (effective batch size 8)
+- Automatic Mixed Precision (torch.amp.autocast)
+- Early stopping monitored on validation loss (patience 15 epochs, max 120 epochs)
+- Stratified 5-fold cross-validation switch across all 184 subjects
+"""
 
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
 
-from asd_classification.config.settings import get_settings
+from asd_classification.data.loader import MultiViewDataset
+from asd_classification.data.split import get_kfold_splits
+from asd_classification.models.baseline.augmentation import VolumeConsistentAugmenter
+from asd_classification.models.baseline.cnn3d import Baseline3DCNN
+from asd_classification.models.baseline.focal_loss import FocalLoss
+from asd_classification.pipelines.evaluate import compute_classification_metrics
+
+
+class EarlyStopping:
+    """Early stopping monitor for deep neural network training.
+
+    Terminates optimization when validation loss fails to improve after
+    a specified patience window of consecutive epochs, avoiding overfitting.
+    """
+
+    def __init__(
+        self,
+        patience: int = 15,
+        min_delta: float = 1e-4,
+        mode: str = "min",
+        checkpoint_path: Optional[Union[str, Path]] = None,
+    ) -> None:
+        """Initialize EarlyStopping.
+
+        Args:
+            patience: Number of epochs with no improvement before stopping (default: 15).
+            min_delta: Minimum change in monitored quantity to qualify as improvement (default: 1e-4).
+            mode: Direction of optimization, 'min' for loss or 'max' for score (default: 'min').
+            checkpoint_path: Optional path to save best model weights.
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+
+        self.counter = 0
+        self.best_loss = float("inf") if mode == "min" else float("-inf")
+        self.early_stop = False
+
+    def __call__(self, val_loss: float, model: Optional[nn.Module] = None) -> bool:
+        """Evaluate validation loss and update early stopping state.
+
+        Args:
+            val_loss: Validation loss observed in the current epoch.
+            model: Optional PyTorch model instance whose weights will be saved on improvement.
+
+        Returns:
+            True if early stopping criterion has been triggered, False otherwise.
+        """
+        if self.mode == "min":
+            improved = val_loss < (self.best_loss - self.min_delta)
+        else:
+            improved = val_loss > (self.best_loss + self.min_delta)
+
+        if improved:
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.checkpoint_path is not None and model is not None:
+                self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                save_fn = getattr(model, "save", None)
+                if callable(save_fn):
+                    save_fn(self.checkpoint_path)
+                else:
+                    torch.save(model.state_dict(), self.checkpoint_path)
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+        return self.early_stop
+
+
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    accumulation_steps: int = 4,
+    device: str = "cpu",
+    augmenter: Optional[nn.Module] = None,
+) -> float:
+    """Execute one training epoch with gradient accumulation and Automatic Mixed Precision.
+
+    Args:
+        model: PyTorch neural network module.
+        dataloader: Training DataLoader delivering batches of (inputs, targets).
+        optimizer: PyTorch optimizer (e.g. Adam).
+        criterion: Loss module (e.g. FocalLoss).
+        scaler: Optional GradScaler for mixed precision (torch.amp).
+        accumulation_steps: Number of batches over which gradients are accumulated (default: 4).
+        device: Execution device ('cuda' or 'cpu').
+        augmenter: Optional data augmentation module.
+
+    Returns:
+        Average training loss over the epoch.
+    """
+    model.train()
+    if augmenter is not None:
+        augmenter.train()
+
+    total_loss = 0.0
+    total_samples = 0
+    optimizer.zero_grad()
+
+    amp_enabled = (torch.device(device).type == "cuda") and (scaler is not None)
+
+    for step_idx, (inputs, targets) in enumerate(dataloader):
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        batch_size = inputs.size(0)
+
+        # Forward pass with AMP when GPU is available
+        if amp_enabled and scaler is not None:
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(inputs)
+                loss = criterion(logits, targets)
+                scaled_loss = loss / accumulation_steps
+            scaler.scale(scaled_loss).backward()
+        else:
+            logits = model(inputs)
+            loss = criterion(logits, targets)
+            scaled_loss = loss / accumulation_steps
+            scaled_loss.backward()
+
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+        # Gradient accumulation step
+        is_accumulation_step = ((step_idx + 1) % accumulation_steps == 0) or (step_idx + 1 == len(dataloader))
+        if is_accumulation_step:
+            if amp_enabled and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+
+    return total_loss / max(total_samples, 1)
+
+
+def evaluate_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: str = "cpu",
+) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
+    """Execute one evaluation epoch on validation or test dataset without augmentation.
+
+    Args:
+        model: PyTorch neural network module.
+        dataloader: Evaluation DataLoader.
+        criterion: Loss module.
+        device: Execution device ('cuda' or 'cpu').
+
+    Returns:
+        Tuple of (average_loss, metrics_dictionary, all_y_true, all_y_pred, all_y_prob).
+    """
+    model.eval()
+
+    total_loss = 0.0
+    total_samples = 0
+    all_targets: List[np.ndarray] = []
+    all_preds: List[np.ndarray] = []
+    all_probs: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            batch_size = inputs.size(0)
+
+            logits = model(inputs)
+            loss = criterion(logits, targets)
+
+            probs = torch.softmax(logits, dim=-1)
+            preds = torch.argmax(logits, dim=-1)
+
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+            all_targets.append(targets.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+
+    y_true = np.concatenate(all_targets) if all_targets else np.array([], dtype=int)
+    y_pred = np.concatenate(all_preds) if all_preds else np.array([], dtype=int)
+    y_prob = np.concatenate(all_probs) if all_probs else np.empty((0, 2), dtype=float)
+
+    avg_loss = total_loss / max(total_samples, 1)
+    metrics = compute_classification_metrics(y_true, y_pred, y_prob=y_prob, loss_value=avg_loss)
+
+    return avg_loss, metrics, y_true, y_pred, y_prob
+
+
+def train_3dcnn_model(
+    model: Baseline3DCNN,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: Optional[nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    epochs: int = 120,
+    accumulation_steps: int = 4,
+    early_stopping_patience: int = 15,
+    checkpoint_path: Optional[Union[str, Path]] = None,
+    device: Optional[str] = None,
+    use_amp: bool = True,
+) -> Dict[str, Any]:
+    """Train Baseline 3D-CNN with early stopping and mixed precision.
+
+    Args:
+        model: Baseline3DCNN model instance.
+        train_loader: Training DataLoader.
+        val_loader: Validation or test DataLoader.
+        criterion: Loss function (defaults to FocalLoss(alpha=0.25, gamma=2.0)).
+        optimizer: Optimizer (defaults to Adam(lr=1e-5, weight_decay=0.0005)).
+        epochs: Maximum training epochs (default: 120).
+        accumulation_steps: Gradient accumulation steps (default: 4).
+        early_stopping_patience: Early stopping patience (default: 15).
+        checkpoint_path: Destination path for saving best model weights.
+        device: Target execution device ('cuda' or 'cpu').
+        use_amp: Enable Automatic Mixed Precision if GPU is available.
+
+    Returns:
+        Dictionary containing training history and best validation metrics.
+    """
+    exec_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(exec_device)
+
+    opt = optimizer or torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=0.0005)
+    loss_fn = criterion or FocalLoss(alpha=0.25, gamma=2.0)
+    scaler = torch.amp.GradScaler("cuda") if (torch.device(exec_device).type == "cuda" and use_amp) else None
+    early_stopping = EarlyStopping(
+        patience=early_stopping_patience,
+        min_delta=1e-4,
+        mode="min",
+        checkpoint_path=checkpoint_path,
+    )
+
+    history: Dict[str, List[Any]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "val_f1": [],
+    }
+
+    best_metrics: Dict[str, float] = {}
+
+    for epoch in range(1, epochs + 1):
+        tr_loss = train_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=opt,
+            criterion=loss_fn,
+            scaler=scaler,
+            accumulation_steps=accumulation_steps,
+            device=exec_device,
+        )
+        v_loss, v_metrics, _, _, _ = evaluate_epoch(
+            model=model,
+            dataloader=val_loader,
+            criterion=loss_fn,
+            device=exec_device,
+        )
+
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(v_loss)
+        history["val_accuracy"].append(v_metrics["accuracy"])
+        history["val_f1"].append(v_metrics["f1_score"])
+
+        if early_stopping(val_loss=v_loss, model=model):
+            break
+        elif early_stopping.counter == 0:
+            best_metrics = v_metrics
+
+    # Restore best checkpoint if saved
+    if checkpoint_path is not None and Path(checkpoint_path).is_file():
+        model.load(checkpoint_path)
+        model.to(exec_device)
+
+    return {
+        "model": model,
+        "history": history,
+        "best_metrics": best_metrics,
+        "stopped_epoch": len(history["train_loss"]),
+    }
+
+
+def run_stratified_kfold_cv(
+    manifest: pd.DataFrame,
+    tensors_dir: Union[str, Path],
+    n_splits: int = 5,
+    epochs: int = 120,
+    accumulation_steps: int = 4,
+    early_stopping_patience: int = 15,
+    device: Optional[str] = None,
+    random_state: int = 42,
+    use_amp: bool = True,
+) -> Dict[str, Any]:
+    """Execute Stratified 5-Fold Cross-Validation across all cohort subjects.
+
+    Args:
+        manifest: Full DataFrame of all cohort subjects with binary 'dx_group'.
+        tensors_dir: Directory containing preprocessed .npz Multi-View Tensors.
+        n_splits: Number of cross-validation folds (default: 5).
+        epochs: Max epochs per fold (default: 120).
+        accumulation_steps: Gradient accumulation steps (default: 4).
+        early_stopping_patience: Early stopping patience (default: 15).
+        device: Device ('cuda' or 'cpu').
+        random_state: Seed for reproducible fold generation (default: 42).
+        use_amp: Enable Automatic Mixed Precision on GPU.
+
+    Returns:
+        Dictionary containing fold metrics and aggregated summary statistics.
+    """
+    exec_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    y = manifest["dx_group"].to_numpy()
+    X = np.arange(len(manifest))
+
+    augmenter = VolumeConsistentAugmenter()
+    fold_results: List[Dict[str, float]] = []
+
+    for fold_idx, (train_indices, val_indices) in enumerate(
+        get_kfold_splits(X, y, n_splits=n_splits, random_state=random_state), 1
+    ):
+        train_sub_df = manifest.iloc[train_indices].reset_index(drop=True)
+        val_sub_df = manifest.iloc[val_indices].reset_index(drop=True)
+
+        ds_train = MultiViewDataset(manifest=train_sub_df, tensors_dir=tensors_dir, transform=augmenter)
+        ds_val = MultiViewDataset(manifest=val_sub_df, tensors_dir=tensors_dir, transform=None)
+
+        train_loader = DataLoader(ds_train, batch_size=2, shuffle=True)
+        val_loader = DataLoader(ds_val, batch_size=2, shuffle=False)
+
+        model = Baseline3DCNN()
+        opt = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=0.0005)
+        loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
+
+        result = train_3dcnn_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=loss_fn,
+            optimizer=opt,
+            epochs=epochs,
+            accumulation_steps=accumulation_steps,
+            early_stopping_patience=early_stopping_patience,
+            device=exec_device,
+            use_amp=use_amp,
+        )
+
+        fold_results.append(result["best_metrics"])
+
+    # Aggregate cross-fold performance
+    metric_keys = ["accuracy", "precision", "recall", "f1_score", "loss"]
+    summary: Dict[str, Dict[str, float]] = {}
+    for key in metric_keys:
+        vals = [f[key] for f in fold_results if key in f]
+        if vals:
+            summary[key] = {
+                "mean": float(np.mean(vals)),
+                "std": float(np.std(vals)),
+            }
+
+    return {
+        "fold_results": fold_results,
+        "summary": summary,
+    }
 
 
 def run_training_pipeline(
-    model_type: str = "svm",
+    model_type: str = "3dcnn",
     data_dir: Optional[Path] = None,
     save_checkpoint: bool = True,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """
-    Executes cross-validation training workflow:
-    1. Loads phenotypic and time-series data.
-    2. Computes FC matrices / builds PyG graphs.
-    3. Runs Stratified K-Fold CV.
-    4. Evaluates training & validation metrics.
-    5. Persists the best model checkpoint to `artifacts/models/`.
-    
+    """Execute model training workflow based on specified architecture.
+
     Args:
-        model_type: 'svm', 'gcn', or 'gat'.
-        data_dir: Directory containing raw ABIDE files.
-        save_checkpoint: Whether to save trained model artifacts.
-        
+        model_type: Model architecture ('3dcnn', 'svm', 'gcn', 'gat').
+        data_dir: Data directory containing manifests or raw acquisitions.
+        save_checkpoint: Whether to persist best model checkpoint.
+        **kwargs: Additional training arguments.
+
     Returns:
-        Summary dictionary with fold metrics and trained model path.
+        Summary dictionary with training results.
     """
-    raise NotImplementedError("Implementation will be added in implementation phase.")
+    if model_type.lower() in ("3dcnn", "baseline_3dcnn"):
+        manifest_path = kwargs.pop("manifest_path", "output/abide_nyu_multiview/metadata.csv")
+        tensors_dir = kwargs.pop("tensors_dir", "output/abide_nyu_multiview/tensors")
+        manifest_df = pd.read_csv(manifest_path)
+        augmenter = kwargs.pop("transform", VolumeConsistentAugmenter())
+        train_ds = MultiViewDataset(manifest=manifest_df, tensors_dir=tensors_dir, split="train", transform=augmenter)
+        test_ds = MultiViewDataset(manifest=manifest_df, tensors_dir=tensors_dir, split="test", transform=None)
+
+        train_loader = DataLoader(train_ds, batch_size=2, shuffle=True)
+        test_loader = DataLoader(test_ds, batch_size=2, shuffle=False)
+
+        model = Baseline3DCNN()
+        ckpt = Path("artifacts/models/best_baseline_3dcnn.pt") if save_checkpoint else None
+        return train_3dcnn_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=test_loader,
+            checkpoint_path=ckpt,
+            **kwargs,
+        )
+
+    raise NotImplementedError(f"Training pipeline for '{model_type}' is not yet implemented.")
