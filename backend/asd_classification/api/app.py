@@ -32,7 +32,7 @@ try:
         return app
 
 except ImportError:
-    def create_app() -> Any:
+    def create_app() -> "FastAPI":  # type: ignore[name-defined]
         raise ImportError(
             "FastAPI is not installed. Install optional dependencies: pip install '.[api]'"
         )

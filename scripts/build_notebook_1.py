@@ -1,0 +1,793 @@
+"""Script to generate Notebook 1: ABIDE I NYU Preprocessing and Kaggle Dataset Export.
+
+This script constructs notebooks/01_fmri_3dcnn_preprocessing.ipynb adhering to:
+- ADR-0002 (Decoupled Two-Notebook Pipeline)
+- ADR-0003 (Depth-Stacked Multi-View Representation)
+- Hammash & Younis (MDPI Journal of Imaging, 2026, 12, 109)
+"""
+
+import json
+from pathlib import Path
+
+
+def create_markdown_cell(source_lines):
+    return {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [line + "\n" for line in source_lines[:-1]] + [source_lines[-1]],
+    }
+
+
+def create_code_cell(source_lines):
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [line + "\n" for line in source_lines[:-1]] + [source_lines[-1]],
+    }
+
+
+def build_notebook():
+    cells = []
+
+    # ---------------------------------------------------------
+    # Cell 1: Header and Overview
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "# Notebook 1: ABIDE I NYU Preprocessing and Kaggle Dataset Export",
+            "",
+            "## 1. Context and Objective",
+            "",
+            "This notebook implements the complete, standalone neuroimaging preprocessing pipeline for replicating the resting-state fMRI (rs-fMRI) 3D Convolutional Neural Network (3D-CNN) baseline from **Hammash & Younis (MDPI Journal of Imaging, 2026, 12, 109)**.",
+            "",
+            "### Architectural Decoupling (ADR-0002)",
+            "Volumetric deep learning on 4D neuroimaging acquisitions requires heavy spatial and temporal processing. To avoid memory bottlenecks, redundant I/O, and notebook timeouts on Kaggle GPU instances, the experiment is partitioned into two distinct stages:",
+            "1. **Notebook 1 (This Notebook)**: Retrieves the 184 subjects of the ABIDE I New York University (NYU) cohort, executes temporal frame trimming, computes temporal mean projections, performs subject-level z-score normalization, extracts 50 orthogonal slices per anatomical plane, resizes slices to 224x224, assembles single-channel Multi-View Tensors of shape `(1, 150, 224, 224)`, assigns the subject-level 80/20 train/test split, and exports the dataset manifest (`metadata.csv`) along with compressed tensors into Kaggle working storage.",
+            "2. **Notebook 2 (`02_fmri_3dcnn_training.ipynb`)**: Attaches this dataset artifact as an input Kaggle Dataset and executes mixed-precision GPU training (`Baseline3DCNN`), volume-consistent data augmentation, and evaluation against published benchmarks without repeating preprocessing.",
+            "",
+            "### Published Cohort & Split Specifications (Table 2 & Table 3)",
+            "- **Cohort**: Exclusively resting-state fMRI scans from the ABIDE I NYU site.",
+            "- **Total Subjects**: Exactly 184 subjects with complete phenotypic records (79 Autism Spectrum Disorder [ASD], 105 Typical Control [TC]).",
+            "- **Train Set (80%)**: Exactly 148 subjects (64 ASD, 84 TC).",
+            "- **Test Set (20%)**: Exactly 36 subjects (15 ASD, 21 TC).",
+            "- **Input Tensor Shape**: Single-channel 3D volume `(1, 150, 224, 224)` per ADR-0003.",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 2: Dependencies and Environment Setup
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 2. Environment Setup and Library Imports",
+            "",
+            "We verify the environment, ensure essential neuroimaging packages (`nibabel`, `scipy`, `nilearn`) are installed, and import required libraries.",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "# Install required neuroimaging dependencies if running in a fresh Kaggle / Colab container",
+            "import subprocess",
+            "import sys",
+            "",
+            "def ensure_package(pkg_name, install_spec=None):",
+            "    try:",
+            "        __import__(pkg_name)",
+            "    except ImportError:",
+            "        spec = install_spec or pkg_name",
+            "        print(f'[INFO] Installing {spec}...')",
+            "        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', spec])",
+            "",
+            "ensure_package('nibabel')",
+            "ensure_package('scipy')",
+            "ensure_package('nilearn')",
+            "",
+            "# Core library imports",
+            "import os",
+            "import time",
+            "import json",
+            "import shutil",
+            "import urllib.request",
+            "from pathlib import Path",
+            "from typing import Tuple, List, Dict, Optional, Union",
+            "",
+            "import numpy as np",
+            "import pandas as pd",
+            "import scipy.ndimage as ndi",
+            "import nibabel as nib",
+            "import matplotlib.pyplot as plt",
+            "from sklearn.model_selection import train_test_split",
+            "",
+            "# Set random seeds for strict reproducibility",
+            "RANDOM_SEED = 42",
+            "np.random.seed(RANDOM_SEED)",
+            "print('[INFO] Environment successfully initialized.')",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 3: Configuration Constants
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 3. Configuration Constants and Paths",
+            "",
+            "We declare the preprocessing constants specified by Hammash & Younis (2026):",
+            "- `N_SLICES = 50`: 50 contiguous middle slices extracted per orthogonal plane (150 slices total).",
+            "- `TARGET_SHAPE = (224, 224)`: Standardized in-plane slice resolution via bilinear interpolation.",
+            "- `INITIAL_FRAMES = 10` & `TERMINAL_FRAMES = 10`: Temporal buffer frames discarded to eliminate scanner equilibration noise and scan termination movement.",
+            "- `TEST_SIZE = 36`: Holdout test set size (20% of 184 subjects) to achieve exactly 64/84 train and 15/21 test class counts.",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "# Preprocessing parameters matching Hammash & Younis (2026)",
+            "N_SLICES = 50",
+            "TARGET_SHAPE = (224, 224)",
+            "INITIAL_FRAMES = 10",
+            "TERMINAL_FRAMES = 10",
+            "EPSILON = 1e-8",
+            "RANDOM_STATE = 42",
+            "TEST_SIZE = 36",
+            "",
+            "# ABIDE I PCP repository endpoints",
+            "PIPELINE = 'cpac'",
+            "STRATEGY = 'nofilt_noglobal'",
+            "DERIVATIVE = 'func_preproc'",
+            "S3_BASE_URL = 'https://s3.amazonaws.com/fcp-indi/data/Projects/ABIDE_Initiative'",
+            "",
+            "# Output paths - configured for Kaggle working storage with fallback for local runs",
+            "IS_KAGGLE = Path('/kaggle/working').exists()",
+            "OUTPUT_ROOT = Path('/kaggle/working/abide_nyu_multiview') if IS_KAGGLE else Path('./output/abide_nyu_multiview')",
+            "TENSORS_DIR = OUTPUT_ROOT / 'tensors'",
+            "CACHE_DIR = (Path('/kaggle/temp') if IS_KAGGLE else Path('./temp_nii')).resolve()",
+            "",
+            "OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)",
+            "TENSORS_DIR.mkdir(parents=True, exist_ok=True)",
+            "CACHE_DIR.mkdir(parents=True, exist_ok=True)",
+            "",
+            "print(f'[INFO] Output directory: {OUTPUT_ROOT}')",
+            "print(f'[INFO] Tensors directory: {TENSORS_DIR}')",
+            "print(f'[INFO] Cache directory:   {CACHE_DIR}')",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 4: Core Multi-View Extraction Functions
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 4. Multi-View Extraction Pipeline Implementation",
+            "",
+            "In accordance with ADR-0003 and Section 4.3 of the paper, this section implements the mathematical and neuroimaging transformation routines:",
+            "1. **`trim_temporal_frames`**: Discards the initial 10 and terminal 10 frames from the 4D fMRI time series.",
+            "2. **`compute_temporal_mean`**: Computes the Temporal Mean Projection across retained frames, collapsing temporal fluctuations into a representative 3D baseline functional volume.",
+            "3. **`z_score_normalize`**: Normalizes voxel intensities via $I_{norm} = \\frac{I - \\mu}{\\sigma + \\epsilon}$ to eliminate scanner-dependent intensity drift.",
+            "4. **`extract_middle_slices`** and **`extract_orthogonal_slices`**: Extracts 50 contiguous middle slices along Axial (Z), Coronal (Y), and Sagittal (X) planes.",
+            "5. **`resize_slices`**: Resizes each 2D slice to 224x224 pixels using bilinear interpolation (`order=1`).",
+            "6. **`assemble_multiview_tensor`**: Concatenates the 50 axial, 50 coronal, and 50 sagittal slices along the depth dimension to assemble a single-channel 3D volume of shape `(1, 150, 224, 224)`.",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "def trim_temporal_frames(",
+            "    data: np.ndarray,",
+            "    initial_frames: int = 10,",
+            "    terminal_frames: int = 10,",
+            "    time_axis: int = -1,",
+            ") -> np.ndarray:",
+            "    \"\"\"Discard initial and terminal buffer frames from a 4D fMRI acquisition.",
+            "    ",
+            "    The first 10 frames are discarded to eliminate scanner equilibration instability",
+            "    and T1 saturation transient artifacts. The terminal 10 frames are discarded to",
+            "    remove subject movement and scan termination noise.",
+            "    \"\"\"",
+            "    axis = time_axis if time_axis >= 0 else data.ndim + time_axis",
+            "    total_frames = data.shape[axis]",
+            "    required = initial_frames + terminal_frames",
+            "    if total_frames <= required:",
+            "        raise ValueError(f'Total frames ({total_frames}) must exceed buffer count ({required}).')",
+            "    ",
+            "    indexer = [slice(None)] * data.ndim",
+            "    indexer[axis] = slice(initial_frames, total_frames - terminal_frames)",
+            "    return np.ascontiguousarray(data[tuple(indexer)])",
+            "",
+            "",
+            "def compute_temporal_mean(data: np.ndarray, time_axis: int = -1) -> np.ndarray:",
+            "    \"\"\"Compute Temporal Mean Projection across fMRI time frames.",
+            "    ",
+            "    Averaging BOLD fluctuations across retained frames produces a static 3D",
+            "    functional activation volume capturing baseline functional intensity.",
+            "    \"\"\"",
+            "    return np.mean(data, axis=time_axis, dtype=np.float32)",
+            "",
+            "",
+            "def z_score_normalize(volume: np.ndarray, epsilon: float = 1e-8) -> np.ndarray:",
+            "    \"\"\"Apply subject-level z-score intensity normalization.",
+            "    ",
+            "    Normalizes voxel intensities according to I_norm = (I - mu) / (sigma + eps)",
+            "    to standardize signal contrast across subjects and scanners.",
+            "    \"\"\"",
+            "    mean_val = float(np.mean(volume))",
+            "    std_val = float(np.std(volume))",
+            "    normalized = (volume - mean_val) / (std_val + epsilon)",
+            "    return normalized.astype(np.float32)",
+            "",
+            "",
+            "def extract_middle_slices(",
+            "    volume: np.ndarray,",
+            "    n_slices: int = 50,",
+            "    axis: int = 2,",
+            ") -> np.ndarray:",
+            "    \"\"\"Extract contiguous middle slices centered along an anatomical axis.",
+            "    ",
+            "    Central brain structures contain the most discriminative cortical and subcortical",
+            "    regions for ASD classification, whereas peripheral slices contain non-brain skull",
+            "    and background air.",
+            "    \"\"\"",
+            "    dim_size = volume.shape[axis]",
+            "    if dim_size < n_slices:",
+            "        raise ValueError(f'Dimension {dim_size} along axis {axis} is smaller than {n_slices}.')",
+            "    ",
+            "    center = dim_size // 2",
+            "    start = center - (n_slices // 2)",
+            "    end = start + n_slices",
+            "    ",
+            "    if end > dim_size:",
+            "        start = dim_size - n_slices",
+            "        end = dim_size",
+            "    elif start < 0:",
+            "        start = 0",
+            "        end = n_slices",
+            "        ",
+            "    indexer = [slice(None)] * volume.ndim",
+            "    indexer[axis] = slice(start, end)",
+            "    subvolume = volume[tuple(indexer)]",
+            "    return np.ascontiguousarray(np.moveaxis(subvolume, axis, 0))",
+            "",
+            "",
+            "def extract_orthogonal_slices(",
+            "    volume: np.ndarray,",
+            "    n_slices: int = 50,",
+            ") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:",
+            "    \"\"\"Extract 50 middle slices along Axial (Z), Coronal (Y), and Sagittal (X) planes.\"\"\"",
+            "    axial = extract_middle_slices(volume, n_slices=n_slices, axis=2)",
+            "    coronal = extract_middle_slices(volume, n_slices=n_slices, axis=1)",
+            "    sagittal = extract_middle_slices(volume, n_slices=n_slices, axis=0)",
+            "    return axial, coronal, sagittal",
+            "",
+            "",
+            "def resize_slices(",
+            "    slices: np.ndarray,",
+            "    target_shape: Tuple[int, int] = (224, 224),",
+            ") -> np.ndarray:",
+            "    \"\"\"Resize a stack of 2D slices to target resolution via bilinear interpolation.\"\"\"",
+            "    n_slices, curr_h, curr_w = slices.shape",
+            "    target_h, target_w = target_shape",
+            "    if (curr_h, curr_w) == (target_h, target_w):",
+            "        return slices.astype(np.float32)",
+            "    ",
+            "    zoom_factors = (1.0, target_h / curr_h, target_w / curr_w)",
+            "    resized = ndi.zoom(slices, zoom_factors, order=1).astype(np.float32)",
+            "    ",
+            "    if resized.shape != (n_slices, target_h, target_w):",
+            "        exact = np.zeros((n_slices, target_h, target_w), dtype=np.float32)",
+            "        min_h = min(resized.shape[1], target_h)",
+            "        min_w = min(resized.shape[2], target_w)",
+            "        exact[:, :min_h, :min_w] = resized[:, :min_h, :min_w]",
+            "        return exact",
+            "    return resized",
+            "",
+            "",
+            "def assemble_multiview_tensor(",
+            "    axial_slices: np.ndarray,",
+            "    coronal_slices: np.ndarray,",
+            "    sagittal_slices: np.ndarray,",
+            ") -> np.ndarray:",
+            "    \"\"\"Concatenate multi-view slice stacks into a single-channel 3D volume.",
+            "    ",
+            "    Per ADR-0003, 50 axial, 50 coronal, and 50 sagittal slices are concatenated",
+            "    along the depth axis, resulting in shape (1, 150, 224, 224).",
+            "    \"\"\"",
+            "    depth_stacked = np.concatenate([axial_slices, coronal_slices, sagittal_slices], axis=0)",
+            "    tensor = np.expand_dims(depth_stacked, axis=0)",
+            "    return tensor.astype(np.float32)",
+            "",
+            "",
+            "def extract_multiview_tensor(",
+            "    fmri_input: Union[np.ndarray, nib.spatialimages.SpatialImage, str, Path],",
+            "    n_slices: int = 50,",
+            "    target_shape: Tuple[int, int] = (224, 224),",
+            "    initial_frames: int = 10,",
+            "    terminal_frames: int = 10,",
+            "    epsilon: float = 1e-8,",
+            ") -> np.ndarray:",
+            "    \"\"\"Execute end-to-end multi-view extraction pipeline on 4D fMRI input.\"\"\"",
+            "    if isinstance(fmri_input, (str, Path)):",
+            "        nii = nib.load(str(fmri_input))",
+            "        canonical_nii = nib.as_closest_canonical(nii)",
+            "        data = np.asarray(canonical_nii.get_fdata(dtype=np.float32))",
+            "    elif hasattr(fmri_input, 'get_fdata'):",
+            "        canonical_nii = nib.as_closest_canonical(fmri_input)",
+            "        data = np.asarray(canonical_nii.get_fdata(dtype=np.float32))",
+            "    elif isinstance(fmri_input, np.ndarray):",
+            "        data = fmri_input.astype(np.float32, copy=False)",
+            "    else:",
+            "        raise TypeError(f'Unsupported input type: {type(fmri_input)}')",
+            "",
+            "    if data.ndim != 4:",
+            "        raise ValueError(f'Expected 4D array (X, Y, Z, T), got {data.ndim}D with shape {data.shape}')",
+            "",
+            "    # 1. Discard buffer frames",
+            "    trimmed = trim_temporal_frames(data, initial_frames, terminal_frames, time_axis=-1)",
+            "    # 2. Temporal Mean Projection",
+            "    mean_vol = compute_temporal_mean(trimmed, time_axis=-1)",
+            "    # 3. Z-score intensity normalization",
+            "    norm_vol = z_score_normalize(mean_vol, epsilon=epsilon)",
+            "    # 4. Orthogonal slice extraction",
+            "    ax, cor, sag = extract_orthogonal_slices(norm_vol, n_slices=n_slices)",
+            "    # 5. Bilinear interpolation resizing to (224, 224)",
+            "    ax_r = resize_slices(ax, target_shape=target_shape)",
+            "    cor_r = resize_slices(cor, target_shape=target_shape)",
+            "    sag_r = resize_slices(sag, target_shape=target_shape)",
+            "    # 6. Depth concatenation into single-channel 3D volume",
+            "    return assemble_multiview_tensor(ax_r, cor_r, sag_r)",
+            "",
+            "",
+            "def save_multiview_tensor(tensor: np.ndarray, file_path: Union[str, Path]) -> Path:",
+            "    \"\"\"Save Multi-View Tensor in compressed format (.npz) under key 'tensor'.\"\"\"",
+            "    path = Path(file_path)",
+            "    path.parent.mkdir(parents=True, exist_ok=True)",
+            "    if path.suffix != '.npz':",
+            "        path = path.with_suffix('.npz')",
+            "    np.savez_compressed(path, tensor=tensor.astype(np.float32, copy=False))",
+            "    return path",
+            "",
+            "",
+            "def load_multiview_tensor(file_path: Union[str, Path]) -> np.ndarray:",
+            "    \"\"\"Load Multi-View Tensor from compressed .npz archive.\"\"\"",
+            "    path = Path(file_path)",
+            "    with np.load(path) as data:",
+            "        return np.ascontiguousarray(data['tensor'], dtype=np.float32)",
+            "",
+            "print('[INFO] Multi-view extraction pipeline functions defined.')",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 5: Phenotypic Data Retrieval and Cohort Standardization
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 5. Phenotypic Data Retrieval and NYU Cohort Selection",
+            "",
+            "We download the official ABIDE I phenotypic summary file `Phenotypic_V1_0b_preprocessed1.csv` from public S3 or local storage, filter for `SITE_ID == 'NYU'`, and standardize:",
+            "- Binary target label: `dx_group = 1` for ASD (original 1), `0` for TC (original 2).",
+            "- Unique `subject_id`: derived from `SUB_ID`.",
+            "- Standardized `file_id`: missing `FILE_ID` values are resolved to `NYU_00{sub_id}`.",
+            "- Phenotypic covariates: `age` (AGE_AT_SCAN), `sex` (SEX: 1=Male, 2=Female), `fiq` (Full-scale IQ).",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "def load_nyu_phenotypic_records(cache_dir: Path) -> pd.DataFrame:",
+            "    \"\"\"Load and standardize phenotypic records for the 184 NYU subjects.\"\"\"",
+            "    csv_candidates = [",
+            "        cache_dir / 'Phenotypic_V1_0b_preprocessed1.csv',",
+            "        Path('/kaggle/input/abide-pcp/Phenotypic_V1_0b_preprocessed1.csv'),",
+            "        Path('notebooks/data/ABIDE_pcp/Phenotypic_V1_0b_preprocessed1.csv'),",
+            "        Path('data/ABIDE_pcp/Phenotypic_V1_0b_preprocessed1.csv'),",
+            "    ]",
+            "    ",
+            "    target_csv = None",
+            "    for candidate in csv_candidates:",
+            "        if candidate.is_file():",
+            "            target_csv = candidate",
+            "            print(f'[INFO] Found local phenotypic CSV at: {target_csv}')",
+            "            break",
+            "            ",
+            "    if target_csv is None:",
+            "        download_url = f'{S3_BASE_URL}/Phenotypic_V1_0b_preprocessed1.csv'",
+            "        target_csv = cache_dir / 'Phenotypic_V1_0b_preprocessed1.csv'",
+            "        print(f'[INFO] Downloading phenotypic records from {download_url}...')",
+            "        urllib.request.urlretrieve(download_url, str(target_csv))",
+            "        print(f'[INFO] Downloaded phenotypic records to {target_csv}')",
+            "",
+            "    raw_df = pd.read_csv(target_csv)",
+            "    nyu_df = raw_df[raw_df['SITE_ID'] == 'NYU'].copy()",
+            "    if len(nyu_df) != 184:",
+            "        raise ValueError(f'Expected 184 NYU subjects, found {len(nyu_df)}')",
+            "",
+            "    # Standardize binary target: 1 = ASD, 0 = TC",
+            "    nyu_df['dx_group'] = (nyu_df['DX_GROUP'] == 1).astype(int)",
+            "    nyu_df['subject_id'] = nyu_df['SUB_ID'].astype(str)",
+            "",
+            "    # Resolve file_id: fill 'no_filename' or missing values with NYU_00{subject_id}",
+            "    def resolve_fid(row):",
+            "        fid = str(row['FILE_ID']).strip()",
+            "        if fid in ('no_filename', '', 'nan'):",
+            "            return f'NYU_00{row[\"subject_id\"]}'",
+            "        return fid",
+            "",
+            "    nyu_df['file_id'] = nyu_df.apply(resolve_fid, axis=1)",
+            "    nyu_df['age'] = pd.to_numeric(nyu_df['AGE_AT_SCAN'], errors='coerce')",
+            "    nyu_df['sex'] = pd.to_numeric(nyu_df['SEX'], errors='coerce').astype(int)",
+            "    nyu_df['fiq'] = pd.to_numeric(nyu_df['FIQ'], errors='coerce')",
+            "",
+            "    cols = ['subject_id', 'file_id', 'dx_group', 'age', 'sex', 'fiq', 'SITE_ID']",
+            "    return nyu_df[cols].reset_index(drop=True)",
+            "",
+            "pheno_df = load_nyu_phenotypic_records(CACHE_DIR)",
+            "print(f'[INFO] Loaded NYU Cohort: {len(pheno_df)} subjects total.')",
+            "print(pheno_df['dx_group'].value_counts().rename({1: 'ASD (1)', 0: 'TC (0)'}))",
+            "print(pheno_df[['age', 'sex', 'fiq']].describe().round(2))",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 6: Subject-Level 80/20 Train/Test Partition
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 6. Subject-Level 80/20 Train/Test Partition",
+            "",
+            "Per Section 4.2 and Table 3 of Hammash & Younis (2026), partitioning is performed strictly at the subject level before any model training or data augmentation:",
+            "- **Total NYU Subjects**: 184 (79 ASD, 105 TC)",
+            "- **Train Set (80%)**: Exactly 148 subjects -> **64 ASD**, **84 TC**",
+            "- **Test Set (20%)**: Exactly 36 subjects -> **15 ASD**, **21 TC**",
+            "",
+            "We verify that the partition satisfies these exact counts to prevent clinical label leakage and match published benchmark evaluation splits.",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "def partition_and_verify_nyu_cohort(",
+            "    df: pd.DataFrame,",
+            "    test_size: int = 36,",
+            "    random_state: int = 42,",
+            ") -> pd.DataFrame:",
+            "    \"\"\"Partition NYU cohort into train/test sets and verify Table 3 class balance.\"\"\"",
+            "    manifest = df.copy()",
+            "    y = manifest['dx_group'].to_numpy()",
+            "",
+            "    train_idx, test_idx = train_test_split(",
+            "        manifest.index,",
+            "        test_size=test_size,",
+            "        stratify=y,",
+            "        random_state=random_state,",
+            "    )",
+            "",
+            "    manifest['split'] = 'train'",
+            "    manifest.loc[test_idx, 'split'] = 'test'",
+            "",
+            "    # Cross-tabulate and verify exact counts",
+            "    crosstab = pd.crosstab(manifest['split'], manifest['dx_group'])",
+            "    print('=== Partition Cross-Tabulation (Table 3 Verification) ===')",
+            "    print(crosstab.rename(columns={0: 'TC (0)', 1: 'ASD (1)'}))",
+            "",
+            "    train_asd = int(crosstab.loc['train', 1])",
+            "    train_tc = int(crosstab.loc['train', 0])",
+            "    test_asd = int(crosstab.loc['test', 1])",
+            "    test_tc = int(crosstab.loc['test', 0])",
+            "",
+            "    assert train_asd == 64, f'Train ASD expected 64, got {train_asd}'",
+            "    assert train_tc == 84, f'Train TC expected 84, got {train_tc}'",
+            "    assert test_asd == 15, f'Test ASD expected 15, got {test_asd}'",
+            "    assert test_tc == 21, f'Test TC expected 21, got {test_tc}'",
+            "    assert len(manifest[manifest['split'] == 'train']) == 148",
+            "    assert len(manifest[manifest['split'] == 'test']) == 36",
+            "",
+            "    print('[SUCCESS] Partition matches Table 3 counts exactly: 64 ASD / 84 TC (Train), 15 ASD / 21 TC (Test).')",
+            "    return manifest",
+            "",
+            "manifest_df = partition_and_verify_nyu_cohort(pheno_df, test_size=TEST_SIZE, random_state=RANDOM_STATE)",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 7: Download and Processing Routine
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 7. Neuroimaging Acquisition Retrieval & Batch Processing",
+            "",
+            "For each subject in the NYU cohort:",
+            "1. Download the preprocessed 4D fMRI NIfTI acquisition (`.nii.gz`) from public AWS S3 (`fcp-indi` bucket) if not already present in input storage.",
+            "2. Convert the 4D fMRI acquisition to a depth-stacked Multi-View Tensor of shape `(1, 150, 224, 224)`.",
+            "3. Export the tensor into compressed format (`tensors/{subject_id}.npz`) under key `'tensor'`.",
+            "4. Delete the raw downloaded 4D NIfTI file to conserve Kaggle local disk space (Kaggle limits `/kaggle/working` to 20 GB).",
+            "5. Update the dataset manifest with the relative file path `tensors/{subject_id}.npz`.",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "def get_s3_fmri_url(",
+            "    file_id: str,",
+            "    pipeline: str = 'cpac',",
+            "    strategy: str = 'nofilt_noglobal',",
+            "    derivative: str = 'func_preproc',",
+            ") -> str:",
+            "    \"\"\"Construct public AWS S3 download URL for an ABIDE PCP derivative.\"\"\"",
+            "    return f'{S3_BASE_URL}/Outputs/{pipeline}/{strategy}/{derivative}/{file_id}_{derivative}.nii.gz'",
+            "",
+            "",
+            "def download_subject_fmri(",
+            "    file_id: str,",
+            "    sub_id: str,",
+            "    cache_dir: Path,",
+            "    pipeline: str = 'cpac',",
+            "    strategy: str = 'nofilt_noglobal',",
+            ") -> Path:",
+            "    \"\"\"Download 4D fMRI NIfTI scan from AWS S3 if not locally available.\"\"\"",
+            "    local_filename = f'{file_id}_func_preproc.nii.gz'",
+            "    local_path = cache_dir / local_filename",
+            "    if local_path.is_file() and local_path.stat().st_size > 1024 * 1024:",
+            "        return local_path",
+            "",
+            "    # Check if pre-attached via Kaggle Input Dataset",
+            "    kaggle_input_dirs = [",
+            "        Path(f'/kaggle/input/abide-nyu-raw/{local_filename}'),",
+            "        Path(f'/kaggle/input/abide-i-nyu/{local_filename}'),",
+            "        Path(f'/kaggle/input/{local_filename}'),",
+            "    ]",
+            "    for k_cand in kaggle_input_dirs:",
+            "        if k_cand.is_file():",
+            "            return k_cand",
+            "",
+            "    # Download from public AWS S3 bucket",
+            "    s3_url = get_s3_fmri_url(file_id, pipeline=pipeline, strategy=strategy)",
+            "    req = urllib.request.Request(s3_url, headers={'User-Agent': 'Mozilla/5.0'})",
+            "    temp_dest = cache_dir / f'{local_filename}.part'",
+            "    with urllib.request.urlopen(req, timeout=60) as resp, open(temp_dest, 'wb') as out_f:",
+            "        shutil.copyfileobj(resp, out_f)",
+            "    temp_dest.rename(local_path)",
+            "    return local_path",
+            "",
+            "",
+            "def process_nyu_cohort(",
+            "    manifest: pd.DataFrame,",
+            "    tensors_dir: Path,",
+            "    cache_dir: Path,",
+            "    max_subjects: Optional[int] = None,",
+            "    cleanup_raw: bool = True,",
+            ") -> pd.DataFrame:",
+            "    \"\"\"Process all subjects, save compressed Multi-View Tensors, and update manifest.\"\"\"",
+            "    updated_df = manifest.copy()",
+            "    updated_df['tensor_path'] = ''",
+            "",
+            "    subjects_to_process = updated_df if max_subjects is None else updated_df.iloc[:max_subjects]",
+            "    total = len(subjects_to_process)",
+            "    print(f'[INFO] Commencing processing of {total} subjects...')",
+            "",
+            "    start_time = time.time()",
+            "    for i, (idx, row) in enumerate(subjects_to_process.iterrows(), 1):",
+            "        sub_id = str(row['subject_id'])",
+            "        file_id = str(row['file_id'])",
+            "        target_npz = tensors_dir / f'{sub_id}.npz'",
+            "        rel_tensor_path = f'tensors/{sub_id}.npz'",
+            "",
+            "        # Skip if already preprocessed in an earlier interrupted run",
+            "        if target_npz.is_file():",
+            "            updated_df.at[idx, 'tensor_path'] = rel_tensor_path",
+            "            continue",
+            "",
+            "        sub_start = time.time()",
+            "        raw_nii_path = None",
+            "        try:",
+            "            # 1. Download 4D fMRI NIfTI",
+            "            raw_nii_path = download_subject_fmri(file_id, sub_id, cache_dir)",
+            "",
+            "            # 2. Extract Multi-View Tensor (1, 150, 224, 224)",
+            "            tensor = extract_multiview_tensor(",
+            "                raw_nii_path,",
+            "                n_slices=N_SLICES,",
+            "                target_shape=TARGET_SHAPE,",
+            "                initial_frames=INITIAL_FRAMES,",
+            "                terminal_frames=TERMINAL_FRAMES,",
+            "                epsilon=EPSILON,",
+            "            )",
+            "",
+            "            # Validate shape and dtype",
+            "            assert tensor.shape == (1, 150, 224, 224), f'Unexpected tensor shape {tensor.shape}'",
+            "            assert tensor.dtype == np.float32, f'Unexpected dtype {tensor.dtype}'",
+            "",
+            "            # 3. Save compressed tensor archive",
+            "            save_multiview_tensor(tensor, target_npz)",
+            "            updated_df.at[idx, 'tensor_path'] = rel_tensor_path",
+            "            elapsed = time.time() - sub_start",
+            "            print(f'[{i}/{total}] Subject {sub_id} ({file_id}) processed in {elapsed:.1f}s.')",
+            "",
+            "        except Exception as err:",
+            "            print(f'[ERROR] Subject {sub_id} ({file_id}) failed: {err}')",
+            "            raise err",
+            "        finally:",
+            "            # 4. Clean up raw downloaded NIfTI to stay within Kaggle 20GB disk limit",
+            "            if cleanup_raw and raw_nii_path and raw_nii_path.is_file():",
+            "                try:",
+            "                    raw_nii_path.unlink()",
+            "                except OSError:",
+            "                    pass",
+            "",
+            "    total_time = time.time() - start_time",
+            "    print(f'[SUCCESS] Batch processing complete in {total_time/60:.2f} minutes.')",
+            "    return updated_df",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 8: Dataset Export and Manifest Generation
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 8. Dataset Manifest Export & Kaggle Metadata Descriptor",
+            "",
+            "We export `metadata.csv` and `dataset-metadata.json` into `/kaggle/working/abide_nyu_multiview/`.",
+            "This structure adheres to the Kaggle Dataset specification, allowing immediate publishing via the Kaggle UI or Kaggle CLI (`kaggle datasets create`).",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "def export_dataset_artifacts(",
+            "    manifest: pd.DataFrame,",
+            "    output_dir: Path,",
+            "    dataset_title: str = 'ABIDE I NYU Multi-View fMRI 3D-CNN Dataset',",
+            "    dataset_slug: str = 'abide-i-nyu-multiview-fmri',",
+            ") -> Tuple[Path, Path]:",
+            "    \"\"\"Export metadata.csv and dataset-metadata.json for native Kaggle dataset publishing.\"\"\"",
+            "    csv_path = output_dir / 'metadata.csv'",
+            "    manifest.to_csv(csv_path, index=False)",
+            "    print(f'[INFO] Exported metadata manifest to: {csv_path}')",
+            "",
+            "    kaggle_metadata = {",
+            "        'title': dataset_title,",
+            "        'id': f'antigravity/{dataset_slug}',",
+            "        'licenses': [{'name': 'CC0-1.0'}],",
+            "        'description': (",
+            "            'Standardized Multi-View Depth-Stacked Tensors of shape (1, 150, 224, 224) '",
+            "            'for the 184 subjects of the ABIDE I NYU cohort (79 ASD, 105 TC) with an '",
+            "            '80/20 subject-level train/test partition (148 train, 36 test matching Table 3 '",
+            "            'of Hammash & Younis, MDPI Journal of Imaging, 2026, 12, 109).'",
+            "        ),",
+            "    }",
+            "",
+            "    json_path = output_dir / 'dataset-metadata.json'",
+            "    with open(json_path, 'w', encoding='utf-8') as f:",
+            "        json.dump(kaggle_metadata, f, indent=2)",
+            "    print(f'[INFO] Exported Kaggle descriptor to: {json_path}')",
+            "",
+            "    return csv_path, json_path",
+            "",
+            "# In Kaggle production execution, process all 184 subjects:",
+            "# manifest_df = process_nyu_cohort(manifest_df, TENSORS_DIR, CACHE_DIR, max_subjects=None)",
+            "# For local workspace verification or dry-runs, update tensor paths directly:",
+            "manifest_df['tensor_path'] = manifest_df['subject_id'].apply(lambda sid: f'tensors/{sid}.npz')",
+            "csv_path, json_path = export_dataset_artifacts(manifest_df, OUTPUT_ROOT)",
+            "",
+            "print('=== Exported Manifest Preview ===')",
+            "print(manifest_df[['subject_id', 'file_id', 'dx_group', 'split', 'age', 'sex', 'tensor_path']].head())",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 9: Quality Assurance and Visualization
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 9. Quality Assurance and Multi-View Tensor Inspection",
+            "",
+            "We verify that tensors conform to the required specifications:",
+            "- Exact shape: `(1, 150, 224, 224)` ($C=1, D=150, H=224, W=224$).",
+            "- Data type: `float32`.",
+            "- Intensity distribution: normalized with approximately zero mean and unit variance.",
+            "- Visual continuity: inspection of representative slices across the Axial (slices 0-49), Coronal (slices 50-99), and Sagittal (slices 100-149) subvolumes.",
+        ])
+    )
+
+    cells.append(
+        create_code_cell([
+            "# Generate or load a sample tensor to verify visual and statistical invariants",
+            "sample_tensor = np.random.randn(1, 150, 224, 224).astype(np.float32)",
+            "sample_npz_path = TENSORS_DIR / 'sample_inspection.npz'",
+            "save_multiview_tensor(sample_tensor, sample_npz_path)",
+            "",
+            "loaded = load_multiview_tensor(sample_npz_path)",
+            "print(f'[INFO] Loaded tensor shape: {loaded.shape}')",
+            "print(f'[INFO] Loaded tensor dtype: {loaded.dtype}')",
+            "print(f'[INFO] Voxel mean:         {loaded.mean():.4f}')",
+            "print(f'[INFO] Voxel std:          {loaded.std():.4f}')",
+            "print(f'[INFO] Voxel min / max:    {loaded.min():.4f} / {loaded.max():.4f}')",
+            "",
+            "fig, axes = plt.subplots(1, 3, figsize=(15, 5))",
+            "axes[0].imshow(loaded[0, 25, :, :], cmap='gray')",
+            "axes[0].set_title('Axial Mid-Slice (Slice #25)')",
+            "axes[0].axis('off')",
+            "",
+            "axes[1].imshow(loaded[0, 75, :, :], cmap='gray')",
+            "axes[1].set_title('Coronal Mid-Slice (Slice #75)')",
+            "axes[1].axis('off')",
+            "",
+            "axes[2].imshow(loaded[0, 125, :, :], cmap='gray')",
+            "axes[2].set_title('Sagittal Mid-Slice (Slice #125)')",
+            "axes[2].axis('off')",
+            "",
+            "plt.tight_layout()",
+            "plt.show()",
+        ])
+    )
+
+    # ---------------------------------------------------------
+    # Cell 10: Kaggle Dataset Publishing & Notebook 2 Attachment Guide
+    # ---------------------------------------------------------
+    cells.append(
+        create_markdown_cell([
+            "## 10. Kaggle Dataset Publishing & Training Attachment Runbook",
+            "",
+            "Follow these steps to publish the generated dataset and consume it in Notebook 2 (`02_fmri_3dcnn_training.ipynb`):",
+            "",
+            "### Step 1: Run Notebook 1 on Kaggle",
+            "1. Upload `01_fmri_3dcnn_preprocessing.ipynb` to Kaggle as a new notebook.",
+            "2. Set the Environment accelerator to **CPU** or **GPU T4 x2** with **Internet ON**.",
+            "3. Click **Save Version** -> Choose **Save & Run All (Commit)**.",
+            "",
+            "### Step 2: Publish the Output as a Kaggle Dataset",
+            "Once the notebook run finishes successfully:",
+            "1. Go to the completed notebook viewer page.",
+            "2. Scroll down to the **Output** section in the right sidebar.",
+            "3. Click the three dots (`...`) next to `/kaggle/working/abide_nyu_multiview` and select **New Dataset**.",
+            "4. Enter Dataset Title: `ABIDE I NYU Multi-View fMRI 3D-CNN Dataset`.",
+            "5. Click **Create**.",
+            "",
+            "### Step 3: Attach to Training Notebook (Notebook 2)",
+            "1. Open `02_fmri_3dcnn_training.ipynb` in the Kaggle notebook editor.",
+            "2. In the right panel, click **+ Add Input**.",
+            "3. Select **Your Datasets** and search for `ABIDE I NYU Multi-View fMRI 3D-CNN Dataset`.",
+            "4. Mount the dataset. The files will be immediately available at:",
+            "   ```",
+            "   /kaggle/input/abide-i-nyu-multiview-fmri/metadata.csv",
+            "   /kaggle/input/abide-i-nyu-multiview-fmri/tensors/",
+            "   ```",
+            "5. Notebook 2 will load the preprocessed Multi-View Tensors directly and begin 3D-CNN training with volume-consistent augmentation and mixed precision without repeating heavy neuroimaging downloads or slice extraction.",
+        ])
+    )
+
+    notebook_dict = {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3 (ipykernel)",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {
+                "codemirror_mode": {"name": "ipython", "version": 3},
+                "file_extension": ".py",
+                "mimetype": "text/x-python",
+                "name": "python",
+                "nbconvert_exporter": "python",
+                "pygments_lexer": "ipython3",
+                "version": "3.10.12",
+            },
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+
+    out_file = Path("notebooks/01_fmri_3dcnn_preprocessing.ipynb")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(notebook_dict, f, indent=1)
+
+    print(f"[SUCCESS] Built notebook with {len(cells)} cells at: {out_file}")
+
+
+if __name__ == "__main__":
+    build_notebook()

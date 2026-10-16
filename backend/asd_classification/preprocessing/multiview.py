@@ -5,9 +5,11 @@ acquisitions into depth-stacked Multi-View Tensors of shape (1, 150, 224, 224)
 in accordance with ADR-0003 and Hammash & Younis (MDPI Journal of Imaging, 2026).
 """
 
+import json
 from pathlib import Path
 from typing import Optional, Tuple, Union
 import numpy as np
+import pandas as pd
 import nibabel as nib
 import scipy.ndimage as ndi
 
@@ -429,3 +431,107 @@ class MultiViewExtractor:
     ) -> np.ndarray:
         """Callable shorthand for extract."""
         return self.extract(fmri_input=fmri_input, time_axis=time_axis)
+
+
+def save_multiview_tensor(
+    tensor: np.ndarray,
+    output_path: Union[str, Path],
+) -> Path:
+    """Save Multi-View Tensor in compressed format (.npz).
+
+    Args:
+        tensor: Multi-view array of shape (1, 150, 224, 224) and dtype float32.
+        output_path: Target path for the output file (e.g. 'tensors/50952.npz').
+
+    Returns:
+        Path object pointing to the written compressed archive.
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.suffix != ".npz":
+        path = path.with_suffix(".npz")
+
+    np.savez_compressed(path, tensor=tensor.astype(np.float32, copy=False))
+    return path
+
+
+def load_multiview_tensor(
+    file_path: Union[str, Path],
+) -> np.ndarray:
+    """Load Multi-View Tensor from compressed archive (.npz) or raw array (.npy).
+
+    Args:
+        file_path: Path to the tensor file.
+
+    Returns:
+        Loaded array of shape (1, 150, 224, 224) and dtype float32.
+
+    Raises:
+        FileNotFoundError: If the specified tensor file does not exist.
+        KeyError: If the .npz archive does not contain the 'tensor' key.
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Tensor file not found at: {path}")
+
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            if "tensor" not in data:
+                raise KeyError(f"Expected key 'tensor' in {path}, found: {list(data.keys())}")
+            tensor = data["tensor"]
+    elif path.suffix == ".npy":
+        tensor = np.load(path)
+    else:
+        with np.load(path) as data:
+            tensor = data["tensor"] if "tensor" in data else data[data.files[0]]
+
+    return np.ascontiguousarray(tensor, dtype=np.float32)
+
+
+def export_dataset_manifest(
+    metadata_df: pd.DataFrame,
+    output_dir: Union[str, Path],
+    dataset_title: str = "ABIDE I NYU Multi-View fMRI 3D-CNN Dataset",
+    dataset_slug: str = "abide-i-nyu-multiview-fmri",
+) -> Tuple[Path, Path]:
+    """Export dataset manifest metadata.csv and Kaggle dataset descriptor.
+
+    Exports:
+    1. 'metadata.csv' containing subject_id, dx_group (ASD=1, TC=0), covariates,
+       and split assignment (80% train, 20% test).
+    2. 'dataset-metadata.json' formatted for direct publishing as a native Kaggle Dataset
+       using the Kaggle CLI ('kaggle datasets create -p <dir>').
+
+    Args:
+        metadata_df: DataFrame containing the dataset manifest.
+        output_dir: Target directory where artifacts will be saved.
+        dataset_title: Human-readable title for the Kaggle Dataset.
+        dataset_slug: Kaggle identifier slug for the dataset.
+
+    Returns:
+        Tuple of (metadata_csv_path, dataset_json_path).
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out_path / "metadata.csv"
+    metadata_df.to_csv(csv_path, index=False)
+
+    kaggle_metadata = {
+        "title": dataset_title,
+        "id": f"antigravity/{dataset_slug}",
+        "licenses": [{"name": "CC0-1.0"}],
+        "description": (
+            "Preprocessed multi-view depth-stacked tensors of shape (1, 150, 224, 224) "
+            "for the 184 subjects of the ABIDE I NYU cohort (79 ASD, 105 TC) with subject-level "
+            "80/20 train/test partition for 3D-CNN Autism Spectrum Disorder classification."
+        ),
+    }
+
+    json_path = out_path / "dataset-metadata.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(kaggle_metadata, f, indent=2)
+
+    return csv_path, json_path
+

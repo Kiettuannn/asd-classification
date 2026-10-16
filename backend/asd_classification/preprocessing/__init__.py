@@ -11,6 +11,9 @@ from asd_classification.preprocessing.multiview import (
     resize_slices,
     trim_temporal_frames,
     z_score_normalize,
+    save_multiview_tensor,
+    load_multiview_tensor,
+    export_dataset_manifest,
 )
 
 __all__ = [
@@ -24,4 +27,8 @@ __all__ = [
     "resize_slices",
     "trim_temporal_frames",
     "z_score_normalize",
+    "save_multiview_tensor",
+    "load_multiview_tensor",
+    "export_dataset_manifest",
 ]
+
