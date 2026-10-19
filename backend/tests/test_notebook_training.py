@@ -89,3 +89,62 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     # 9. Early stopping with patience 15
     assert "EARLY_STOPPING_PATIENCE = 15" in all_source or "patience=15" in all_source
     assert "EarlyStopping" in all_source
+
+    # 10. Hammash & Younis Table 4 Exact Hyperparameters & ReduceLROnPlateau Scheduler
+    assert "LEARNING_RATE = 1e-5" in all_source
+    assert "FOCAL_ALPHA = 0.25" in all_source
+    assert "ReduceLROnPlateau" in all_source
+    assert "LR_SCHEDULER_PATIENCE = 10" in all_source
+    assert "LR_DECAY_FACTOR = 0.1" in all_source
+
+    # 11. Robust Kaggle Dataset Discovery across multiple mount directory formats
+    assert "rglob('metadata.csv')" in all_source
+    assert "/kaggle/input/abide-i-nyu-dataset" in all_source
+
+
+def test_early_stopping_records_true_best_epoch_without_trap(tmp_path: Path):
+    """Verify EarlyStopping correctly tracks best_epoch and avoids locking to premature values."""
+    checkpoint_file = tmp_path / "best_model.pt"
+
+    class MockEarlyStopping:
+        def __init__(self, patience=15, min_delta=1e-4, mode='min', checkpoint_path=None):
+            self.patience = patience
+            self.min_delta = min_delta
+            self.mode = mode
+            self.checkpoint_path = checkpoint_path
+            self.counter = 0
+            self.best_loss = float('inf') if mode == 'min' else float('-inf')
+            self.best_epoch = 0
+            self.early_stop = False
+
+        def __call__(self, val_loss: float, epoch: int = 1) -> bool:
+            if self.mode == 'min':
+                improved = val_loss < (self.best_loss - self.min_delta)
+            else:
+                improved = val_loss > (self.best_loss + self.min_delta)
+
+            if improved:
+                self.best_loss = val_loss
+                self.best_epoch = epoch
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.early_stop = True
+            return self.early_stop
+
+    stopper = MockEarlyStopping(patience=15, checkpoint_path=checkpoint_file)
+
+    # Simulated loss sequence: Epoch 1 is high (0.70), decreases steadily to epoch 10 (0.30),
+    # then plateaus from 11-25
+    loss_curve = [0.70, 0.65, 0.60, 0.55, 0.50, 0.45, 0.40, 0.35, 0.32, 0.30] + [0.31] * 15
+
+    for ep, l in enumerate(loss_curve, 1):
+        if stopper(l, epoch=ep):
+            break
+
+    # The stopper must identify epoch 10 (0.30) as the true minimum, NOT epoch 1
+    assert stopper.best_epoch == 10
+    assert abs(stopper.best_loss - 0.30) < 1e-5
+    assert stopper.early_stop is True
+

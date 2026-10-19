@@ -16,7 +16,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from asd_classification.models.baseline.cnn3d import Baseline3DCNN
+from asd_classification.models.baseline.cnn3d import (
+    Baseline3DCNN,
+    SEBlock3D,
+    SEResBlock3D,
+    SEResNet3D,
+)
 from asd_classification.models.baseline.focal_loss import FocalLoss
 from asd_classification.models.baseline.augmentation import VolumeConsistentAugmenter
 
@@ -315,3 +320,130 @@ def test_volume_consistent_augmenter_parameter_bounds():
         assert 0.9 <= params["intensity_scale"] <= 1.1
         assert isinstance(params["flip_horizontal"], bool)
         assert isinstance(params["flip_vertical"], bool)
+
+
+# ---------------------------------------------------------------------------
+# 4. SEResNet3D, SEResBlock3D, and SEBlock3D Architecture Tests
+# ---------------------------------------------------------------------------
+
+def test_se_block_3d_forward_and_scaling():
+    """Verify SEBlock3D produces identical output shapes and channel recalibration scales."""
+    se = SEBlock3D(channels=64, reduction=16)
+    inputs = torch.randn(2, 64, 8, 14, 14, dtype=torch.float32)
+
+    outputs = se(inputs)
+    assert outputs.shape == inputs.shape
+    assert not torch.isnan(outputs).any()
+    assert not torch.isinf(outputs).any()
+
+    # Verify floor on bottleneck channel reduction for small channel counts
+    se_small = SEBlock3D(channels=32, reduction=16)
+    # 32 // 16 = 2, but max(2, 8) = 8
+    linear_layer = [m for m in se_small.fc if isinstance(m, nn.Linear)][0]
+    assert linear_layer.out_features == 8
+
+
+def test_seres_block_3d_identity_and_downsample():
+    """Verify SEResBlock3D identity shortcut for stride=1 and downsampling shortcut for stride=2."""
+    # Identity shortcut when stride=1 and in_channels == out_channels
+    identity_block = SEResBlock3D(in_channels=64, out_channels=64, stride=1)
+    assert isinstance(identity_block.shortcut, nn.Identity)
+
+    x_same = torch.randn(2, 64, 8, 14, 14, dtype=torch.float32)
+    out_same = identity_block(x_same)
+    assert out_same.shape == (2, 64, 8, 14, 14)
+
+    # Downsampling shortcut when stride=2 and channels change
+    downsample_block = SEResBlock3D(in_channels=32, out_channels=64, stride=2)
+    assert isinstance(downsample_block.shortcut, nn.Sequential)
+
+    x_down = torch.randn(2, 32, 16, 28, 28, dtype=torch.float32)
+    out_down = downsample_block(x_down)
+    assert out_down.shape == (2, 64, 8, 14, 14)
+
+
+def test_seresnet_3d_architecture_and_parameter_count():
+    """Verify SEResNet3D stage progression, dropout rate, and ~3.6M parameter capacity."""
+    model = SEResNet3D(in_channels=1, num_classes=2, dropout=0.4)
+
+    assert model.channel_progression == [32, 64, 128, 256]
+    assert math.isclose(model.dropout_rate, 0.4, rel_tol=1e-5)
+
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # SEResNet3D has ~3.598M parameters, well matched with Baseline3DCNN's 3.38M
+    assert 3_500_000 <= total_params <= 3_700_000, f"Unexpected parameter count: {total_params}"
+
+
+def test_seresnet_3d_forward_pass_shape():
+    """Verify forward pass on synthetic batch (2, 1, 150, 224, 224) outputs logits of shape (2, 2)."""
+    model = SEResNet3D(in_channels=1, num_classes=2, dropout=0.4)
+    model.eval()
+
+    inputs = torch.randn(2, 1, 150, 224, 224, dtype=torch.float32)
+    with torch.no_grad():
+        logits = model(inputs)
+
+    assert logits.shape == (2, 2)
+    assert not torch.isnan(logits).any()
+    assert not torch.isinf(logits).any()
+
+
+def test_seresnet_3d_amp_forward_backward():
+    """Verify forward and backward propagation under Automatic Mixed Precision updates all gradients."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    amp_dtype = torch.float16 if device == "cuda" else torch.bfloat16
+
+    model = SEResNet3D(in_channels=1, num_classes=2, dropout=0.4).to(device)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=0.0005)
+
+    inputs = torch.randn(2, 1, 16, 32, 32, dtype=torch.float32, device=device)
+    targets = torch.tensor([0, 1], dtype=torch.long, device=device)
+
+    optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=amp_dtype):
+        logits = model(inputs)
+        loss = F.cross_entropy(logits, targets)
+
+    assert torch.isfinite(loss).item()
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"Parameter {name} did not receive gradients."
+            assert not torch.isnan(param.grad).any(), f"Parameter {name} has NaN gradients."
+            assert not torch.isinf(param.grad).any(), f"Parameter {name} has Inf gradients."
+
+    optimizer.step()
+
+
+def test_seresnet_3d_predict_and_proba():
+    """Verify predict and predict_proba return expected numpy arrays and probabilities sum to 1.0."""
+    model = SEResNet3D(in_channels=1, num_classes=2, dropout=0.4)
+    model.eval()
+
+    inputs = torch.randn(3, 1, 16, 32, 32, dtype=torch.float32)
+    preds = model.predict(inputs)
+    probas = model.predict_proba(inputs)
+
+    assert isinstance(preds, np.ndarray)
+    assert isinstance(probas, np.ndarray)
+    assert preds.shape == (3,)
+    assert probas.shape == (3, 2)
+    np.testing.assert_allclose(probas.sum(axis=-1), np.ones(3), atol=1e-5)
+
+
+def test_seresnet_3d_save_and_load(tmp_path: Path):
+    """Verify SEResNet3D model weights can be saved to and loaded from disk."""
+    model = SEResNet3D(in_channels=1, num_classes=2, dropout=0.4)
+    save_file = tmp_path / "seresnet3d.pt"
+
+    model.save(save_file)
+    assert save_file.is_file()
+
+    restored = SEResNet3D(in_channels=1, num_classes=2, dropout=0.4)
+    restored.load(save_file)
+
+    for p1, p2 in zip(model.parameters(), restored.parameters()):
+        torch.testing.assert_close(p1, p2)
+
