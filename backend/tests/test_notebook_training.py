@@ -86,20 +86,30 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     assert "79.05" in all_source
     assert "0.4932" in all_source
 
-    # 9. Early stopping with patience 15
+    # 9. Early stopping with patience
     assert "EARLY_STOPPING_PATIENCE = 15" in all_source or "patience=15" in all_source
+    assert "EARLY_STOPPING_PATIENCE = 30" in all_source or "patience=30" in all_source
     assert "EarlyStopping" in all_source
 
-    # 10. Hammash & Younis Table 4 Exact Hyperparameters & ReduceLROnPlateau Scheduler
+    # 10. Hyperparameters & ReduceLROnPlateau Scheduler
     assert "LEARNING_RATE = 1e-5" in all_source
+    assert "LEARNING_RATE = 5e-5" in all_source
     assert "FOCAL_ALPHA = 0.25" in all_source
     assert "ReduceLROnPlateau" in all_source
     assert "LR_SCHEDULER_PATIENCE = 10" in all_source
+    assert "LR_SCHEDULER_PATIENCE = 20" in all_source
     assert "LR_DECAY_FACTOR = 0.1" in all_source
+    assert "LR_DECAY_FACTOR = 0.5" in all_source
 
     # 11. Robust Kaggle Dataset Discovery across multiple mount directory formats
     assert "rglob('metadata.csv')" in all_source
     assert "/kaggle/input/abide-i-nyu-dataset" in all_source
+
+    # 12. Issue #10 Fixes: Baseline 3D-CNN default, num_workers=0, class-weighted Cross-Entropy
+    assert "MODEL_ARCH = 'baseline_3dcnn'" in all_source
+    assert "num_workers=0" in all_source
+    assert "CrossEntropyLoss" in all_source
+    assert "class_weights" in all_source
 
 
 def test_early_stopping_records_true_best_epoch_without_trap(tmp_path: Path):

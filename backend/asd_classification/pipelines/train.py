@@ -387,10 +387,38 @@ def run_stratified_kfold_cv(
     }
 
 
+def compute_class_weights(labels: Union[np.ndarray, torch.Tensor, List[int]]) -> torch.Tensor:
+    """Compute balanced class weights using inverse-frequency weighting.
+
+    Formula: weight_c = total_samples / (num_classes * count_c)
+
+    Args:
+        labels: 1D array-like of binary or multi-class labels.
+
+    Returns:
+        1D float32 tensor of class weights.
+    """
+    if isinstance(labels, torch.Tensor):
+        labels_arr = labels.cpu().numpy()
+    else:
+        labels_arr = np.asarray(labels)
+
+    classes, counts = np.unique(labels_arr, return_counts=True)
+    total_samples = len(labels_arr)
+    num_classes = len(classes)
+
+    weights = np.zeros(num_classes, dtype=np.float32)
+    for cls, count in zip(classes, counts):
+        weights[int(cls)] = total_samples / (num_classes * count)
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 def run_training_pipeline(
     model_type: str = "3dcnn",
     data_dir: Optional[Path] = None,
     save_checkpoint: bool = True,
+    class_weights: Optional[Union[List[float], torch.Tensor]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Execute model training workflow based on specified architecture.
@@ -399,6 +427,7 @@ def run_training_pipeline(
         model_type: Model architecture ('3dcnn', 'svm', 'gcn', 'gat').
         data_dir: Data directory containing manifests or raw acquisitions.
         save_checkpoint: Whether to persist best model checkpoint.
+        class_weights: Optional class weights for weighted CrossEntropyLoss.
         **kwargs: Additional training arguments.
 
     Returns:
@@ -417,10 +446,17 @@ def run_training_pipeline(
 
         model = Baseline3DCNN()
         ckpt = Path("artifacts/models/best_baseline_3dcnn.pt") if save_checkpoint else None
+
+        criterion = kwargs.pop("criterion", None)
+        if criterion is None and class_weights is not None:
+            weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
+            criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
         return train_3dcnn_model(
             model=model,
             train_loader=train_loader,
             val_loader=test_loader,
+            criterion=criterion,
             checkpoint_path=ckpt,
             **kwargs,
         )

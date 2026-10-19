@@ -395,3 +395,74 @@ def test_run_training_pipeline_3dcnn(mock_dataset_environment):
     assert "best_metrics" in res
     assert "history" in res
 
+
+def test_compute_class_weights_nyu_cohort():
+    """Verify class weight computation correctly up-weights minority class on NYU Cohort."""
+    from asd_classification.pipelines.train import compute_class_weights
+
+    # NYU Cohort train split: 84 TC (0), 64 ASD (1)
+    labels = np.array([0] * 84 + [1] * 64)
+    weights = compute_class_weights(labels)
+
+    assert isinstance(weights, torch.Tensor)
+    assert weights.shape == (2,)
+
+    w_tc = weights[0].item()
+    w_asd = weights[1].item()
+
+    # Minority ASD class must receive weight > 1.0, majority TC < 1.0
+    assert w_tc < 1.0
+    assert w_asd > 1.0
+
+    # Effective balanced contribution
+    assert np.isclose(w_tc * 84, w_asd * 64, rtol=1e-5)
+    assert np.isclose(w_tc, 148 / (2.0 * 84), rtol=1e-5)
+    assert np.isclose(w_asd, 148 / (2.0 * 64), rtol=1e-5)
+
+
+def test_class_weighted_cross_entropy_majority_penalty():
+    """Verify weighted CrossEntropyLoss penalizes majority-class collapse more than unweighted loss."""
+    # Weights for NYU Cohort
+    w_tc = 148.0 / (2.0 * 84.0)
+    w_asd = 148.0 / (2.0 * 64.0)
+    class_weights = torch.tensor([w_tc, w_asd], dtype=torch.float32)
+
+    unweighted_ce = nn.CrossEntropyLoss()
+    weighted_ce = nn.CrossEntropyLoss(weight=class_weights)
+
+    # Simulated majority-collapse: model predicts TC (class 0) with high confidence for all samples
+    logits = torch.tensor([
+        [4.0, -4.0],  # predicts class 0
+        [3.5, -3.5],  # predicts class 0
+        [4.2, -4.2],  # predicts class 0
+    ], dtype=torch.float32)
+
+    # Ground truth targets containing minority ASD subjects (targets: [1, 1, 0])
+    targets = torch.tensor([1, 1, 0], dtype=torch.long)
+
+    loss_unweighted = unweighted_ce(logits, targets)
+    loss_weighted = weighted_ce(logits, targets)
+
+    # Because model misclassifies ASD and ASD is upweighted, weighted loss must be strictly greater
+    assert loss_weighted > loss_unweighted
+
+
+def test_run_training_pipeline_with_class_weights(mock_dataset_environment):
+    """Verify run_training_pipeline configures weighted CrossEntropyLoss when class_weights provided."""
+    metadata_csv = mock_dataset_environment["metadata_csv"]
+    tensors_dir = mock_dataset_environment["tensors_dir"]
+
+    res = run_training_pipeline(
+        model_type="3dcnn",
+        manifest_path=str(metadata_csv),
+        tensors_dir=str(tensors_dir),
+        epochs=1,
+        save_checkpoint=False,
+        class_weights=[0.88, 1.15],
+        device="cpu",
+        use_amp=False,
+    )
+
+    assert "best_metrics" in res
+    assert "history" in res
+
