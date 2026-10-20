@@ -86,14 +86,16 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     assert "79.05" in all_source
     assert "0.4932" in all_source
 
-    # 9. Early stopping with patience
+    # 9. Early stopping with patience and warmup suppression (Issue #11)
     assert "EARLY_STOPPING_PATIENCE = 15" in all_source or "patience=15" in all_source
-    assert "EARLY_STOPPING_PATIENCE = 30" in all_source or "patience=30" in all_source
+    assert "EARLY_STOPPING_PATIENCE = 25" in all_source or "patience=25" in all_source
+    assert "WARMUP_EPOCHS = 15" in all_source or "warmup_epochs=15" in all_source
     assert "EarlyStopping" in all_source
 
-    # 10. Hyperparameters & ReduceLROnPlateau Scheduler
+    # 10. Hyperparameters, Cosine Annealing, and Plateau Scheduler
     assert "LEARNING_RATE = 1e-5" in all_source
-    assert "LEARNING_RATE = 5e-5" in all_source
+    assert "LEARNING_RATE = 1e-4" in all_source
+    assert "compute_cosine_warmup_lr" in all_source
     assert "FOCAL_ALPHA = 0.25" in all_source
     assert "ReduceLROnPlateau" in all_source
     assert "LR_SCHEDULER_PATIENCE = 10" in all_source
@@ -110,6 +112,11 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     assert "num_workers=0" in all_source
     assert "CrossEntropyLoss" in all_source
     assert "class_weights" in all_source
+
+    # 13. Issue #11 Fixes: Composite Metric Checkpointing & Diagnostics
+    assert "composite_score" in all_source
+    assert "balanced_accuracy" in all_source
+    assert "specificity" in all_source
 
 
 def test_early_stopping_records_true_best_epoch_without_trap(tmp_path: Path):

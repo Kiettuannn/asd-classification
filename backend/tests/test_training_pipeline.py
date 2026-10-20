@@ -466,3 +466,126 @@ def test_run_training_pipeline_with_class_weights(mock_dataset_environment):
     assert "best_metrics" in res
     assert "history" in res
 
+
+
+def test_compute_classification_metrics_includes_composite_score():
+    """Verify compute_classification_metrics calculates specificity, balanced_accuracy, and composite_score."""
+    # Perfect classification
+    y_true_perfect = np.array([0, 0, 1, 1])
+    y_pred_perfect = np.array([0, 0, 1, 1])
+    m_perfect = compute_classification_metrics(y_true_perfect, y_pred_perfect)
+
+    assert "specificity" in m_perfect
+    assert "balanced_accuracy" in m_perfect
+    assert "composite_score" in m_perfect
+    assert m_perfect["specificity"] == 1.0
+    assert m_perfect["recall"] == 1.0
+    assert m_perfect["balanced_accuracy"] == 1.0
+    assert m_perfect["f1_score"] == 1.0
+    assert m_perfect["composite_score"] == 1.0
+
+    # Majority class guess (predict all TC = 0)
+    # y_true has 2 ASD (1) and 2 TC (0)
+    y_true_maj = np.array([1, 1, 0, 0])
+    y_pred_maj = np.array([0, 0, 0, 0])
+    m_maj = compute_classification_metrics(y_true_maj, y_pred_maj)
+
+    assert m_maj["specificity"] == 1.0
+    assert m_maj["recall"] == 0.0
+    assert m_maj["balanced_accuracy"] == 0.5
+    assert m_maj["f1_score"] == 0.0
+    # Composite score: 0.5 * 0.0 + 0.5 * 0.5 = 0.25
+    assert np.isclose(m_maj["composite_score"], 0.25, rtol=1e-5)
+
+
+def test_early_stopping_warmup_suppression(tmp_path):
+    """Verify EarlyStopping suppresses checkpoint saving and patience count during warmup."""
+    checkpoint_file = tmp_path / "best_model.pt"
+    model = nn.Linear(4, 2)
+
+    stopper = EarlyStopping(
+        patience=5,
+        min_delta=1e-4,
+        mode="max",
+        checkpoint_path=checkpoint_file,
+        warmup_epochs=15,
+    )
+
+    # During warmup (epochs 1 to 15), simulate fluctuating random scores
+    for ep in range(1, 16):
+        score = 0.5 + 0.1 * (ep % 3)
+        stopped = stopper(val_score=score, model=model, epoch=ep)
+        assert stopped is False
+        assert stopper.counter == 0
+        # Checkpoint must NOT be saved during warmup
+        assert not checkpoint_file.is_file()
+
+    # Post-warmup: epoch 16 achieves real initial benchmark score
+    stopper(val_score=0.70, model=model, epoch=16)
+    assert stopper.counter == 0
+    assert stopper.best_epoch == 16
+    assert np.isclose(stopper.best_score, 0.70, rtol=1e-5)
+    assert checkpoint_file.is_file()
+
+
+def test_early_stopping_mode_max_composite_score(tmp_path):
+    """Verify EarlyStopping in mode='max' tracks peak composite score and stops after patience."""
+    checkpoint_file = tmp_path / "best_model.pt"
+    model = nn.Linear(4, 2)
+
+    stopper = EarlyStopping(
+        patience=3,
+        min_delta=1e-3,
+        mode="max",
+        checkpoint_path=checkpoint_file,
+        warmup_epochs=5,
+    )
+
+    # Warmup epochs 1-5
+    for ep in range(1, 6):
+        stopper(val_score=0.99, model=model, epoch=ep)  # High noise during warmup ignored
+
+    # Post-warmup:
+    # Epoch 6: 0.70 (best so far)
+    assert stopper(val_score=0.70, model=model, epoch=6) is False
+    assert stopper.best_epoch == 6
+
+    # Epoch 7: 0.75 (new best)
+    assert stopper(val_score=0.75, model=model, epoch=7) is False
+    assert stopper.best_epoch == 7
+
+    # Epoch 8: 0.74 (no improvement, counter=1)
+    assert stopper(val_score=0.74, model=model, epoch=8) is False
+    assert stopper.counter == 1
+
+    # Epoch 9: 0.73 (no improvement, counter=2)
+    assert stopper(val_score=0.73, model=model, epoch=9) is False
+    assert stopper.counter == 2
+
+    # Epoch 10: 0.72 (no improvement, counter=3 >= patience -> stop!)
+    assert stopper(val_score=0.72, model=model, epoch=10) is True
+    assert stopper.counter == 3
+    assert stopper.best_epoch == 7
+
+
+def test_cosine_annealing_with_warmup_schedule():
+    """Verify learning rate warms up linearly then decays monotonically under cosine curve."""
+    from asd_classification.pipelines.train import compute_cosine_warmup_lr
+
+    lrs = [
+        compute_cosine_warmup_lr(epoch=ep, warmup_epochs=5, max_epochs=100, peak_lr=1e-4, min_lr=1e-6, start_lr=1e-5)
+        for ep in range(1, 101)
+    ]
+
+    # Epoch 1 starts at start_lr
+    assert np.isclose(lrs[0], 1e-5, rtol=1e-4)
+
+    # Linear warmup increases monotonically up to peak_lr at epoch 5
+    for i in range(4):
+        assert lrs[i] < lrs[i + 1]
+    assert np.isclose(lrs[4], 1e-4, rtol=1e-4)
+
+    # Cosine decay decreases monotonically after epoch 5 down to min_lr at epoch 100
+    for i in range(4, 99):
+        assert lrs[i] > lrs[i + 1]
+    assert np.isclose(lrs[-1], 1e-6, rtol=1e-4)

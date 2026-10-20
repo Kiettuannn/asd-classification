@@ -66,11 +66,25 @@ def compute_classification_metrics(
     y_true_np = np.asarray(y_true).astype(int).ravel()
     y_pred_np = np.asarray(y_pred).astype(int).ravel()
 
+    acc = float(accuracy_score(y_true_np, y_pred_np))
+    prec = float(precision_score(y_true_np, y_pred_np, zero_division=0))
+    rec = float(recall_score(y_true_np, y_pred_np, zero_division=0))
+    f1 = float(f1_score(y_true_np, y_pred_np, zero_division=0))
+
+    tn = int(np.sum((y_true_np == 0) & (y_pred_np == 0)))
+    fp = int(np.sum((y_true_np == 0) & (y_pred_np == 1)))
+    specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+    balanced_acc = float(0.5 * (rec + specificity))
+    composite = float(0.5 * f1 + 0.5 * balanced_acc)
+
     metrics: Dict[str, float] = {
-        "accuracy": float(accuracy_score(y_true_np, y_pred_np)),
-        "precision": float(precision_score(y_true_np, y_pred_np, zero_division=0)),
-        "recall": float(recall_score(y_true_np, y_pred_np, zero_division=0)),
-        "f1_score": float(f1_score(y_true_np, y_pred_np, zero_division=0)),
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1_score": f1,
+        "specificity": specificity,
+        "balanced_accuracy": balanced_acc,
+        "composite_score": composite,
     }
 
     if loss_value is not None:

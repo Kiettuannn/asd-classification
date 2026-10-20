@@ -11,6 +11,7 @@ Hammash & Younis (MDPI Journal of Imaging, 2026, 12, 109) with:
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -25,11 +26,46 @@ from asd_classification.models.baseline.focal_loss import FocalLoss
 from asd_classification.pipelines.evaluate import compute_classification_metrics
 
 
+def compute_cosine_warmup_lr(
+    epoch: int,
+    warmup_epochs: int = 5,
+    max_epochs: int = 100,
+    peak_lr: float = 1e-4,
+    min_lr: float = 1e-6,
+    start_lr: float = 1e-5,
+) -> float:
+    """Compute learning rate for a given epoch using linear warmup and cosine decay.
+
+    Args:
+        epoch: Current 1-based epoch index (1 <= epoch <= max_epochs).
+        warmup_epochs: Number of linear warmup epochs (default: 5).
+        max_epochs: Total optimization epochs (default: 100).
+        peak_lr: Maximum learning rate reached after warmup (default: 1e-4).
+        min_lr: Minimum learning rate at terminal epoch (default: 1e-6).
+        start_lr: Initial learning rate at epoch 1 (default: 1e-5).
+
+    Returns:
+        Scheduled learning rate float value.
+    """
+    if epoch <= warmup_epochs:
+        if warmup_epochs <= 1:
+            return float(peak_lr)
+        alpha = (epoch - 1) / float(warmup_epochs - 1)
+        return float(start_lr + alpha * (peak_lr - start_lr))
+
+    # Cosine annealing phase
+    progress = (epoch - warmup_epochs) / float(max(max_epochs - warmup_epochs, 1))
+    progress = min(max(progress, 0.0), 1.0)
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(min_lr + (peak_lr - min_lr) * cosine_decay)
+
+
 class EarlyStopping:
     """Early stopping monitor for deep neural network training.
 
-    Terminates optimization when validation loss fails to improve after
+    Terminates optimization when validation metric fails to improve after
     a specified patience window of consecutive epochs, avoiding overfitting.
+    Supports warmup epoch suppression to avoid prematurely saving unlearned initial weights.
     """
 
     def __init__(
@@ -38,6 +74,7 @@ class EarlyStopping:
         min_delta: float = 1e-4,
         mode: str = "min",
         checkpoint_path: Optional[Union[str, Path]] = None,
+        warmup_epochs: int = 0,
     ) -> None:
         """Initialize EarlyStopping.
 
@@ -46,33 +83,58 @@ class EarlyStopping:
             min_delta: Minimum change in monitored quantity to qualify as improvement (default: 1e-4).
             mode: Direction of optimization, 'min' for loss or 'max' for score (default: 'min').
             checkpoint_path: Optional path to save best model weights.
+            warmup_epochs: Initial epochs during which checkpointing and patience are suppressed (default: 0).
         """
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+        self.warmup_epochs = warmup_epochs
 
         self.counter = 0
         self.best_loss = float("inf") if mode == "min" else float("-inf")
+        self.best_score = float("-inf") if mode == "max" else float("inf")
+        self.best_epoch = 0
         self.early_stop = False
 
-    def __call__(self, val_loss: float, model: Optional[nn.Module] = None) -> bool:
-        """Evaluate validation loss and update early stopping state.
+    def __call__(
+        self,
+        val_score: Optional[float] = None,
+        model: Optional[nn.Module] = None,
+        epoch: int = 1,
+        val_loss: Optional[float] = None,
+    ) -> bool:
+        """Evaluate validation metric and update early stopping state.
 
         Args:
-            val_loss: Validation loss observed in the current epoch.
+            val_score: Validation metric value (loss for 'min', composite score/accuracy for 'max').
             model: Optional PyTorch model instance whose weights will be saved on improvement.
+            epoch: Current 1-based training epoch.
+            val_loss: Legacy alias for val_score.
 
         Returns:
             True if early stopping criterion has been triggered, False otherwise.
         """
+        if val_score is None:
+            val_score = val_loss if val_loss is not None else 0.0
+
+        current = float(val_score)
+
+        # Suppress checkpoint saving and patience count during initial warmup epochs
+        if epoch <= self.warmup_epochs:
+            return False
+
+        target_best = self.best_score if self.mode == "max" else self.best_loss
+
         if self.mode == "min":
-            improved = val_loss < (self.best_loss - self.min_delta)
+            improved = current < (target_best - self.min_delta)
         else:
-            improved = val_loss > (self.best_loss + self.min_delta)
+            improved = current > (target_best + self.min_delta)
 
         if improved:
-            self.best_loss = val_loss
+            self.best_loss = current
+            self.best_score = current
+            self.best_epoch = epoch
             self.counter = 0
             if self.checkpoint_path is not None and model is not None:
                 self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
