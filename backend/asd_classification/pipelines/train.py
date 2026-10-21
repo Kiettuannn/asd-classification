@@ -21,9 +21,12 @@ from torch.utils.data import DataLoader, Subset
 from asd_classification.data.loader import MultiViewDataset
 from asd_classification.data.split import get_kfold_splits
 from asd_classification.models.baseline.augmentation import VolumeConsistentAugmenter
-from asd_classification.models.baseline.cnn3d import Baseline3DCNN
+from asd_classification.models.baseline.cnn3d import Baseline3DCNN, SEResNet3D
 from asd_classification.models.baseline.focal_loss import FocalLoss
-from asd_classification.pipelines.evaluate import compute_classification_metrics
+from asd_classification.pipelines.evaluate import (
+    compute_classification_metrics,
+    evaluate_multiview_ensemble,
+)
 
 
 def compute_cosine_warmup_lr(
@@ -275,7 +278,7 @@ def evaluate_epoch(
 
 
 def train_3dcnn_model(
-    model: Baseline3DCNN,
+    model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
     criterion: Optional[nn.Module] = None,
@@ -286,11 +289,15 @@ def train_3dcnn_model(
     checkpoint_path: Optional[Union[str, Path]] = None,
     device: Optional[str] = None,
     use_amp: bool = True,
+    val_dataset: Optional[Any] = None,
+    early_stopping_metric: str = "composite_score",
+    early_stopping_mode: str = "max",
+    warmup_epochs: int = 0,
 ) -> Dict[str, Any]:
-    """Train Baseline 3D-CNN with early stopping and mixed precision.
+    """Train 3D-CNN architecture with early stopping and mixed precision.
 
     Args:
-        model: Baseline3DCNN model instance.
+        model: PyTorch 3D-CNN model instance (SEResNet3D or Baseline3DCNN).
         train_loader: Training DataLoader.
         val_loader: Validation or test DataLoader.
         criterion: Loss function (defaults to FocalLoss(alpha=0.25, gamma=2.0)).
@@ -301,6 +308,10 @@ def train_3dcnn_model(
         checkpoint_path: Destination path for saving best model weights.
         device: Target execution device ('cuda' or 'cpu').
         use_amp: Enable Automatic Mixed Precision if GPU is available.
+        val_dataset: Optional validation MultiViewDataset for 3-view soft voting evaluation.
+        early_stopping_metric: Metric to monitor for early stopping (default: 'composite_score').
+        early_stopping_mode: Optimization mode ('max' or 'min').
+        warmup_epochs: Suppression window epochs for early stopping (default: 0).
 
     Returns:
         Dictionary containing training history and best validation metrics.
@@ -314,8 +325,9 @@ def train_3dcnn_model(
     early_stopping = EarlyStopping(
         patience=early_stopping_patience,
         min_delta=1e-4,
-        mode="min",
+        mode=early_stopping_mode,
         checkpoint_path=checkpoint_path,
+        warmup_epochs=warmup_epochs,
     )
 
     history: Dict[str, List[Any]] = {
@@ -323,9 +335,12 @@ def train_3dcnn_model(
         "val_loss": [],
         "val_accuracy": [],
         "val_f1": [],
+        "val_composite_score": [],
     }
 
     best_metrics: Dict[str, float] = {}
+
+    val_ds = val_dataset
 
     for epoch in range(1, epochs + 1):
         tr_loss = train_epoch(
@@ -337,26 +352,51 @@ def train_3dcnn_model(
             accumulation_steps=accumulation_steps,
             device=exec_device,
         )
-        v_loss, v_metrics, _, _, _ = evaluate_epoch(
-            model=model,
-            dataloader=val_loader,
-            criterion=loss_fn,
-            device=exec_device,
-        )
+
+        if val_ds is not None and hasattr(val_ds, "get_subject_views"):
+            ensemble_res = evaluate_multiview_ensemble(
+                model=model,
+                dataset=val_ds,
+                device=exec_device,
+                criterion=loss_fn,
+            )
+            v_metrics = ensemble_res["subject_metrics"]
+            v_loss = float(v_metrics.get("loss", 0.0))
+        else:
+            v_loss, v_metrics, _, _, _ = evaluate_epoch(
+                model=model,
+                dataloader=val_loader,
+                criterion=loss_fn,
+                device=exec_device,
+            )
 
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(v_loss)
         history["val_accuracy"].append(v_metrics["accuracy"])
         history["val_f1"].append(v_metrics["f1_score"])
+        history["val_composite_score"].append(v_metrics.get("composite_score", v_metrics["f1_score"]))
 
-        if early_stopping(val_loss=v_loss, model=model):
+        if early_stopping_mode == "max":
+            monitored_val = v_metrics.get(early_stopping_metric, v_metrics.get("composite_score", v_metrics["accuracy"]))
+        else:
+            monitored_val = v_loss
+
+        if early_stopping(val_score=monitored_val, model=model, epoch=epoch):
             break
         elif early_stopping.counter == 0:
             best_metrics = v_metrics
 
     # Restore best checkpoint if saved
     if checkpoint_path is not None and Path(checkpoint_path).is_file():
-        model.load(checkpoint_path)
+        load_fn = getattr(model, "load", None)
+        if callable(load_fn):
+            load_fn(checkpoint_path)
+        else:
+            ckpt_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if isinstance(ckpt_dict, dict) and "state_dict" in ckpt_dict:
+                model.load_state_dict(ckpt_dict["state_dict"])
+            elif isinstance(ckpt_dict, dict):
+                model.load_state_dict(ckpt_dict)
         model.to(exec_device)
 
     return {
@@ -372,24 +412,41 @@ def run_stratified_kfold_cv(
     tensors_dir: Union[str, Path],
     n_splits: int = 5,
     epochs: int = 120,
-    accumulation_steps: int = 4,
+    accumulation_steps: int = 2,
     early_stopping_patience: int = 15,
     device: Optional[str] = None,
     random_state: int = 42,
     use_amp: bool = True,
+    model_arch: str = "se_resnet3d",
+    decomposed: bool = True,
+    batch_size: int = 4,
+    learning_rate: float = 1e-5,
+    weight_decay: float = 0.001,
+    label_smoothing: float = 0.1,
+    warmup_epochs: int = 15,
 ) -> Dict[str, Any]:
     """Execute Stratified 5-Fold Cross-Validation across all cohort subjects.
+
+    Supports Multi-View Plane Decomposition (Option 3) with dynamic 3-view training
+    and patient-level soft-voting ensemble validation within each fold.
 
     Args:
         manifest: Full DataFrame of all cohort subjects with binary 'dx_group'.
         tensors_dir: Directory containing preprocessed .npz Multi-View Tensors.
         n_splits: Number of cross-validation folds (default: 5).
         epochs: Max epochs per fold (default: 120).
-        accumulation_steps: Gradient accumulation steps (default: 4).
+        accumulation_steps: Gradient accumulation steps (default: 2).
         early_stopping_patience: Early stopping patience (default: 15).
         device: Device ('cuda' or 'cpu').
         random_state: Seed for reproducible fold generation (default: 42).
         use_amp: Enable Automatic Mixed Precision on GPU.
+        model_arch: Architecture to train ('se_resnet3d' or 'baseline_3dcnn').
+        decomposed: Enable dynamic multi-view decomposition (triples samples).
+        batch_size: Physical batch size (default: 4).
+        learning_rate: Optimizer learning rate (default: 1e-5).
+        weight_decay: L2 weight decay regularization factor (default: 0.001).
+        label_smoothing: Label smoothing regularization factor (default: 0.1).
+        warmup_epochs: Early stopping warmup suppression window (default: 15).
 
     Returns:
         Dictionary containing fold metrics and aggregated summary statistics.
@@ -407,25 +464,50 @@ def run_stratified_kfold_cv(
         train_sub_df = manifest.iloc[train_indices].reset_index(drop=True)
         val_sub_df = manifest.iloc[val_indices].reset_index(drop=True)
 
-        ds_train = MultiViewDataset(manifest=train_sub_df, tensors_dir=tensors_dir, transform=augmenter)
-        ds_val = MultiViewDataset(manifest=val_sub_df, tensors_dir=tensors_dir, transform=None)
+        if decomposed:
+            ds_train = MultiViewDataset(
+                manifest=train_sub_df,
+                tensors_dir=tensors_dir,
+                split=None,
+                view="decomposed",
+                transform=augmenter,
+            )
+        else:
+            ds_train = MultiViewDataset(
+                manifest=train_sub_df,
+                tensors_dir=tensors_dir,
+                split=None,
+                transform=augmenter,
+            )
 
-        train_loader = DataLoader(ds_train, batch_size=2, shuffle=True)
-        val_loader = DataLoader(ds_val, batch_size=2, shuffle=False)
+        ds_val = MultiViewDataset(manifest=val_sub_df, tensors_dir=tensors_dir, split=None, transform=None)
 
-        model = Baseline3DCNN()
-        opt = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=0.0005)
-        loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
+        train_loader = DataLoader(ds_train, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(ds_val, batch_size=batch_size, shuffle=False)
+
+        if model_arch.lower() in ("se_resnet3d", "seresnet3d"):
+            model: nn.Module = SEResNet3D()
+        else:
+            model = Baseline3DCNN()
+
+        train_labels = ds_train.get_labels()
+        class_weights = compute_class_weights(train_labels).to(exec_device)
+        loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        opt = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         result = train_3dcnn_model(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
+            val_dataset=ds_val if decomposed else None,
             criterion=loss_fn,
             optimizer=opt,
             epochs=epochs,
             accumulation_steps=accumulation_steps,
             early_stopping_patience=early_stopping_patience,
+            early_stopping_metric="composite_score",
+            early_stopping_mode="max",
+            warmup_epochs=warmup_epochs,
             device=exec_device,
             use_amp=use_amp,
         )
@@ -433,10 +515,20 @@ def run_stratified_kfold_cv(
         fold_results.append(result["best_metrics"])
 
     # Aggregate cross-fold performance
-    metric_keys = ["accuracy", "precision", "recall", "f1_score", "loss"]
+    metric_keys = [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1_score",
+        "specificity",
+        "balanced_accuracy",
+        "composite_score",
+        "loss",
+        "roc_auc",
+    ]
     summary: Dict[str, Dict[str, float]] = {}
     for key in metric_keys:
-        vals = [f[key] for f in fold_results if key in f]
+        vals = [f[key] for f in fold_results if key in f and not np.isnan(f[key])]
         if vals:
             summary[key] = {
                 "mean": float(np.mean(vals)),
@@ -477,48 +569,102 @@ def compute_class_weights(labels: Union[np.ndarray, torch.Tensor, List[int]]) ->
 
 
 def run_training_pipeline(
-    model_type: str = "3dcnn",
+    model_type: str = "se_resnet3d",
     data_dir: Optional[Path] = None,
     save_checkpoint: bool = True,
     class_weights: Optional[Union[List[float], torch.Tensor]] = None,
+    decomposed: Optional[bool] = None,
+    batch_size: int = 4,
+    accumulation_steps: int = 2,
+    weight_decay: float = 0.001,
+    label_smoothing: float = 0.1,
+    learning_rate: float = 1e-5,
+    early_stopping_patience: int = 15,
+    warmup_epochs: int = 15,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Execute model training workflow based on specified architecture.
 
     Args:
-        model_type: Model architecture ('3dcnn', 'svm', 'gcn', 'gat').
+        model_type: Model architecture ('se_resnet3d', 'baseline_3dcnn', 'svm', 'gcn', 'gat').
         data_dir: Data directory containing manifests or raw acquisitions.
         save_checkpoint: Whether to persist best model checkpoint.
         class_weights: Optional class weights for weighted CrossEntropyLoss.
+        decomposed: Enable dynamic multi-view decomposition (Option 3). Defaults to True for SEResNet3D.
+        batch_size: Physical batch size (default: 4).
+        accumulation_steps: Gradient accumulation steps (default: 2).
+        weight_decay: L2 regularization factor (default: 0.001).
+        label_smoothing: Label smoothing regularization factor (default: 0.1).
+        learning_rate: Initial learning rate (default: 1e-5).
+        early_stopping_patience: Patience for early stopping (default: 15).
+        warmup_epochs: Suppression window epochs for early stopping (default: 15).
         **kwargs: Additional training arguments.
 
     Returns:
         Summary dictionary with training results.
     """
-    if model_type.lower() in ("3dcnn", "baseline_3dcnn"):
+    if model_type.lower() in ("3dcnn", "baseline_3dcnn", "se_resnet3d", "seresnet3d"):
         manifest_path = kwargs.pop("manifest_path", "output/abide_nyu_multiview/metadata.csv")
         tensors_dir = kwargs.pop("tensors_dir", "output/abide_nyu_multiview/tensors")
         manifest_df = pd.read_csv(manifest_path)
         augmenter = kwargs.pop("transform", VolumeConsistentAugmenter())
-        train_ds = MultiViewDataset(manifest=manifest_df, tensors_dir=tensors_dir, split="train", transform=augmenter)
-        test_ds = MultiViewDataset(manifest=manifest_df, tensors_dir=tensors_dir, split="test", transform=None)
 
-        train_loader = DataLoader(train_ds, batch_size=2, shuffle=True)
-        test_loader = DataLoader(test_ds, batch_size=2, shuffle=False)
+        is_decomposed = (
+            decomposed
+            if decomposed is not None
+            else (model_type.lower() in ("se_resnet3d", "seresnet3d"))
+        )
 
-        model = Baseline3DCNN()
-        ckpt = Path("artifacts/models/best_baseline_3dcnn.pt") if save_checkpoint else None
+        train_ds = MultiViewDataset(
+            manifest=manifest_df,
+            tensors_dir=tensors_dir,
+            split="train",
+            view="decomposed" if is_decomposed else "all",
+            transform=augmenter,
+        )
+        test_ds = MultiViewDataset(
+            manifest=manifest_df,
+            tensors_dir=tensors_dir,
+            split="test",
+            transform=None,
+        )
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+        if model_type.lower() in ("se_resnet3d", "seresnet3d"):
+            model: nn.Module = SEResNet3D()
+            ckpt_name = "best_se_resnet3d.pt"
+        else:
+            model = Baseline3DCNN()
+            ckpt_name = "best_baseline_3dcnn.pt"
+
+        ckpt = Path(f"artifacts/models/{ckpt_name}") if save_checkpoint else None
 
         criterion = kwargs.pop("criterion", None)
-        if criterion is None and class_weights is not None:
-            weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
-            criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        if criterion is None:
+            if class_weights is not None:
+                weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
+            else:
+                weight_tensor = compute_class_weights(train_ds.get_labels())
+            criterion = nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
+
+        optimizer = kwargs.pop("optimizer", None)
+        if optimizer is None:
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         return train_3dcnn_model(
             model=model,
             train_loader=train_loader,
             val_loader=test_loader,
+            val_dataset=test_ds if is_decomposed else None,
             criterion=criterion,
+            optimizer=optimizer,
+            accumulation_steps=accumulation_steps,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_metric="composite_score",
+            early_stopping_mode="max",
+            warmup_epochs=warmup_epochs,
             checkpoint_path=ckpt,
             **kwargs,
         )

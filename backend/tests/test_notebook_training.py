@@ -107,8 +107,8 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     assert "rglob('metadata.csv')" in all_source
     assert "/kaggle/input/abide-i-nyu-dataset" in all_source
 
-    # 12. Issue #10 Fixes: Baseline 3D-CNN default, num_workers=0, class-weighted Cross-Entropy
-    assert "MODEL_ARCH = 'baseline_3dcnn'" in all_source
+    # 12. Issue #10 & #12: Architecture defaults, num_workers=0, class-weighted Cross-Entropy
+    assert "MODEL_ARCH = 'se_resnet3d'" in all_source or "MODEL_ARCH = 'baseline_3dcnn'" in all_source
     assert "num_workers=0" in all_source
     assert "CrossEntropyLoss" in all_source
     assert "class_weights" in all_source
@@ -117,6 +117,17 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     assert "composite_score" in all_source
     assert "balanced_accuracy" in all_source
     assert "specificity" in all_source
+
+    # 14. Issue #12: Multi-View Decomposition and Soft-Voting Ensemble
+    assert "MODEL_ARCH = 'se_resnet3d'" in all_source
+    assert "PHYSICAL_BATCH_SIZE = 4" in all_source
+    assert "ACCUMULATION_STEPS = 2" in all_source
+    assert "LABEL_SMOOTHING = 0.1" in all_source
+    assert "WEIGHT_DECAY = 0.001" in all_source
+    assert "view='decomposed'" in all_source
+    assert "aggregate_soft_voting_probabilities" in all_source
+    assert "evaluate_multiview_ensemble" in all_source
+    assert "display_dual_level_benchmark_table" in all_source
 
 
 def test_early_stopping_records_true_best_epoch_without_trap(tmp_path: Path):

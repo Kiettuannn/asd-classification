@@ -150,11 +150,15 @@ class ABIDELoader:
 
 
 class MultiViewDataset(Dataset):
-    """PyTorch Dataset for depth-stacked multi-view fMRI volumetric tensors.
+    """PyTorch Dataset for multi-view fMRI volumetric tensors.
 
-    Loads preprocessed multi-view tensors of shape (1, 150, 224, 224) from compressed
-    .npz archives and associates them with binary diagnostic labels (1=ASD, 0=TC)
-    from metadata.csv.
+    Supports:
+    1. Full depth-stacked multi-view tensors of shape (1, 150, 224, 224).
+    2. Dynamic decomposed view extraction (Option 3: View-as-Sample) into three
+       50-slice sub-volumes (Axial, Coronal, Sagittal) of shape (1, 50, 224, 224),
+       tripling effective sample size while preserving anatomical spatial continuity.
+    3. Single view selection ('axial', 'coronal', 'sagittal').
+    4. Optional in-memory caching of .npz tensors to eliminate disk I/O bottleneck.
     """
 
     def __init__(
@@ -163,6 +167,10 @@ class MultiViewDataset(Dataset):
         tensors_dir: Optional[Union[str, Path]] = None,
         split: Optional[str] = None,
         transform: Optional[Any] = None,
+        view: str = "all",
+        decomposed: bool = False,
+        cache_tensors: bool = False,
+        slices_per_view: Optional[int] = None,
     ) -> None:
         """Initialize MultiViewDataset.
 
@@ -171,6 +179,10 @@ class MultiViewDataset(Dataset):
             tensors_dir: Optional root directory containing .npz tensor files.
             split: Optional split filter: 'train', 'test', or None/'all'.
             transform: Optional volume-consistent transformation module.
+            view: Extraction view mode ('all', 'axial', 'coronal', 'sagittal', 'decomposed').
+            decomposed: Boolean flag forcing dynamic 3-view decomposition (Option 3).
+            cache_tensors: Boolean flag enabling in-memory tensor caching after initial read.
+            slices_per_view: Optional slice count per orthogonal plane (default: 50, or inferred as D // 3).
         """
         self._manifest_dir: Optional[Path]
         if isinstance(manifest, (str, Path)):
@@ -196,9 +208,18 @@ class MultiViewDataset(Dataset):
         self.tensors_dir = Path(tensors_dir) if tensors_dir is not None else None
         self.split = split
         self.transform = transform
+        self.view = view.lower()
+        self.decomposed = decomposed or (self.view == "decomposed")
+        self.cache_tensors = cache_tensors
+        self.slices_per_view = slices_per_view
+        self._tensor_cache: Dict[str, np.ndarray] = {}
 
     def __len__(self) -> int:
-        return len(self.manifest_df)
+        n_subjects = len(self.manifest_df)
+        if self.decomposed:
+            # Tripled sample count: each subject yields 3 orthogonal views
+            return n_subjects * 3
+        return n_subjects
 
     def _resolve_tensor_file(self, row: pd.Series) -> Path:
         sub_id = str(row["subject_id"])
@@ -237,17 +258,55 @@ class MultiViewDataset(Dataset):
             f"Checked locations: {[str(c) for c in candidates[:4]]}"
         )
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        row = self.manifest_df.iloc[idx]
-        file_path = self._resolve_tensor_file(row)
+    def _load_raw_tensor(self, subject_idx: int) -> np.ndarray:
+        row = self.manifest_df.iloc[subject_idx]
+        sub_id = str(row["subject_id"])
+        if self.cache_tensors and sub_id in self._tensor_cache:
+            return self._tensor_cache[sub_id]
 
+        file_path = self._resolve_tensor_file(row)
         with np.load(file_path) as npz:
             tensor_np = npz["tensor"]
+
+        if self.cache_tensors:
+            self._tensor_cache[sub_id] = tensor_np
+
+        return tensor_np
+
+    def _extract_view_slice(self, tensor: torch.Tensor, view_idx: int) -> torch.Tensor:
+        total_depth = tensor.shape[1]
+        spv = self.slices_per_view if self.slices_per_view is not None else (total_depth // 3)
+        start_idx = view_idx * spv
+        end_idx = start_idx + spv
+        return tensor[:, start_idx:end_idx, :, :]
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.decomposed:
+            subject_idx = idx // 3
+            view_idx = idx % 3
+        else:
+            subject_idx = idx
+            view_idx = -1
+
+        row = self.manifest_df.iloc[subject_idx]
+        tensor_np = self._load_raw_tensor(subject_idx)
 
         tensor = torch.from_numpy(tensor_np).float()
         # Ensure single channel dimension (1, D, H, W)
         if tensor.ndim == 3:
             tensor = tensor.unsqueeze(0)
+
+        total_depth = tensor.shape[1]
+        spv = self.slices_per_view if self.slices_per_view is not None else (total_depth // 3)
+
+        if self.decomposed:
+            tensor = self._extract_view_slice(tensor, view_idx)
+        elif self.view == "axial":
+            tensor = tensor[:, 0:spv, :, :]
+        elif self.view == "coronal":
+            tensor = tensor[:, spv:2 * spv, :, :]
+        elif self.view == "sagittal":
+            tensor = tensor[:, 2 * spv:3 * spv, :, :]
 
         if self.transform is not None:
             tensor = self.transform(tensor)
@@ -258,4 +317,46 @@ class MultiViewDataset(Dataset):
         return tensor, torch.tensor(label, dtype=torch.long)
 
     def get_labels(self) -> np.ndarray:
-        return self.manifest_df["dx_group"].to_numpy(dtype=np.int64)
+        base_labels = self.manifest_df["dx_group"].to_numpy(dtype=np.int64)
+        if self.decomposed:
+            return np.repeat(base_labels, 3)
+        return base_labels
+
+    def get_subject_views(self, subject_idx: int) -> Tuple[Dict[str, torch.Tensor], int]:
+        """Return all three orthogonal 50-slice sub-volumes and label for a subject.
+
+        Args:
+            subject_idx: 0-based subject index within manifest_df.
+
+        Returns:
+            Tuple of (dict mapping 'axial', 'coronal', 'sagittal' to 4D tensors, ground-truth label int).
+        """
+        row = self.manifest_df.iloc[subject_idx]
+        tensor_np = self._load_raw_tensor(subject_idx)
+        tensor = torch.from_numpy(tensor_np).float()
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+
+        total_depth = tensor.shape[1]
+        spv = self.slices_per_view if self.slices_per_view is not None else (total_depth // 3)
+
+        views = {
+            "axial": tensor[:, 0:spv, :, :],
+            "coronal": tensor[:, spv:2 * spv, :, :],
+            "sagittal": tensor[:, 2 * spv:3 * spv, :, :],
+        }
+        label = int(row["dx_group"])
+        return views, label
+
+    def get_subject_views_tensor(self, subject_idx: int) -> Tuple[torch.Tensor, int]:
+        """Return all three orthogonal views stacked as a 5D tensor of shape (3, 1, D_view, H, W).
+
+        Args:
+            subject_idx: 0-based subject index within manifest_df.
+
+        Returns:
+            Tuple of (stacked views tensor of shape (3, 1, D_view, H, W), ground-truth label int).
+        """
+        views_dict, label = self.get_subject_views(subject_idx)
+        stacked = torch.stack([views_dict["axial"], views_dict["coronal"], views_dict["sagittal"]], dim=0)
+        return stacked, label

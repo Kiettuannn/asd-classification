@@ -341,6 +341,7 @@ class SEResBlock3D(nn.Module):
         self.bn2 = nn.BatchNorm3d(out_channels)
         self.se = SEBlock3D(out_channels, reduction=reduction)
 
+        self.shortcut: nn.Module
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv3d(

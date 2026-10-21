@@ -21,6 +21,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 import torch
+import torch.nn.functional as F
 
 
 # Published benchmarks for rs-fMRI multi-view 50 slices (Hammash & Younis 2026, Table 8)
@@ -235,6 +236,221 @@ def plot_roc_curve(
     plt.close(fig)
 
     return auc_score, out_file
+
+
+def aggregate_soft_voting_probabilities(
+    view_probs: Union[Dict[str, np.ndarray], np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Aggregate multi-view probabilities via soft-voting ensemble.
+
+    Computes patient diagnostic probabilities by taking the arithmetic mean of
+    predicted class probabilities across the three orthogonal anatomical planes
+    (Axial, Coronal, Sagittal):
+        P_subject(ASD) = (P_axial + P_coronal + P_sagittal) / 3
+
+    This cancels uncorrelated per-view prediction variance and provides stable
+    subject-level diagnostic decisions.
+
+    Args:
+        view_probs: Either a dictionary with keys ('axial', 'coronal', 'sagittal')
+            mapping to arrays of shape (N, 2), or a 3D numpy array of shape (N, 3, 2).
+
+    Returns:
+        Tuple of (subject_probabilities of shape (N, 2), subject_predictions of shape (N,)).
+    """
+    if isinstance(view_probs, dict):
+        prob_stack = np.stack(
+            [view_probs["axial"], view_probs["coronal"], view_probs["sagittal"]],
+            axis=1,
+        )
+    else:
+        prob_stack = np.asarray(view_probs)
+
+    # Average along view dimension (axis 1)
+    subject_probs = np.mean(prob_stack, axis=1)
+    subject_preds = np.argmax(subject_probs, axis=1)
+
+    return subject_probs, subject_preds
+
+
+def evaluate_multiview_ensemble(
+    model: torch.nn.Module,
+    dataset: Any,
+    device: Optional[str] = None,
+    criterion: Optional[torch.nn.Module] = None,
+) -> Dict[str, Any]:
+    """Execute dual-level evaluation of 3D-CNN using 3-view soft-voting ensemble.
+
+    For each subject in the dataset:
+    1. Evaluates Axial, Coronal, and Sagittal 50-slice sub-volumes independently.
+    2. Computes per-view softmax diagnostic probabilities.
+    3. Aggregates per-view probabilities via soft-voting average to derive subject-level diagnosis.
+    4. Computes comprehensive diagnostic metrics at both the Subject Level and View Level.
+
+    Args:
+        model: Trained 3D-CNN model (SEResNet3D or Baseline3DCNN).
+        dataset: MultiViewDataset containing subject tensors and labels.
+        device: Target execution device ('cuda' or 'cpu').
+        criterion: Optional loss function for computing evaluated loss.
+
+    Returns:
+        Dictionary containing:
+        - 'subject_metrics': Subject-level diagnostic metrics dictionary.
+        - 'view_metrics': Per-view metrics dictionary ('axial', 'coronal', 'sagittal').
+        - 'subject_probabilities': Array of shape (N, 2) with ensembled probabilities.
+        - 'subject_predictions': Array of shape (N,) with discrete class predictions.
+        - 'subject_targets': Array of shape (N,) with ground-truth binary labels.
+        - 'view_probabilities': Dictionary of per-view probability arrays.
+    """
+    exec_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(exec_device)
+    model.eval()
+
+    n_subjects = len(dataset.manifest_df) if hasattr(dataset, "manifest_df") else len(dataset)
+    axial_probs_list = []
+    coronal_probs_list = []
+    sagittal_probs_list = []
+    labels_list = []
+    total_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for i in range(n_subjects):
+            views_dict, label = dataset.get_subject_views(i)
+            labels_list.append(label)
+
+            # Stack 3 views for efficient batch inference of shape (3, 1, D_view, H, W)
+            batch_views = torch.stack(
+                [views_dict["axial"], views_dict["coronal"], views_dict["sagittal"]],
+                dim=0,
+            ).to(exec_device)
+
+            logits = model(batch_views)
+            probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
+
+            axial_probs_list.append(probs[0])
+            coronal_probs_list.append(probs[1])
+            sagittal_probs_list.append(probs[2])
+
+            if criterion is not None:
+                target_tensor = torch.tensor([label, label, label], device=exec_device, dtype=torch.long)
+                loss_val = criterion(logits, target_tensor)
+                total_loss += float(loss_val.item()) * 3
+                total_samples += 3
+
+    view_probs = {
+        "axial": np.array(axial_probs_list, dtype=np.float32),
+        "coronal": np.array(coronal_probs_list, dtype=np.float32),
+        "sagittal": np.array(sagittal_probs_list, dtype=np.float32),
+    }
+    y_true = np.array(labels_list, dtype=np.int64)
+
+    # 1. Subject-level soft voting aggregation
+    subject_probs, subject_preds = aggregate_soft_voting_probabilities(view_probs)
+    mean_loss = (total_loss / total_samples) if total_samples > 0 else None
+    subject_metrics = compute_classification_metrics(
+        y_true=y_true,
+        y_pred=subject_preds,
+        y_prob=subject_probs,
+        loss_value=mean_loss,
+    )
+
+    # 2. View-level independent metrics
+    view_metrics = {}
+    for v_name in ["axial", "coronal", "sagittal"]:
+        v_prob = view_probs[v_name]
+        v_pred = np.argmax(v_prob, axis=1)
+        view_metrics[v_name] = compute_classification_metrics(
+            y_true=y_true,
+            y_pred=v_pred,
+            y_prob=v_prob,
+        )
+
+    return {
+        "subject_metrics": subject_metrics,
+        "view_metrics": view_metrics,
+        "subject_probabilities": subject_probs,
+        "subject_predictions": subject_preds,
+        "subject_targets": y_true,
+        "view_probabilities": view_probs,
+    }
+
+
+def format_dual_level_report(
+    subject_metrics: Dict[str, float],
+    view_metrics: Dict[str, Dict[str, float]],
+) -> pd.DataFrame:
+    """Format dual-level diagnostic metrics comparing Subject-Level and View-Level results.
+
+    Benchmarking:
+    - Subject-Level Soft-Voting Ensemble is compared directly against published Table 8.
+    - View-Level performance (Axial, Coronal, Sagittal) reports anatomical plane contributions per Table 3.
+
+    Args:
+        subject_metrics: Computed subject-level ensemble metrics.
+        view_metrics: Dictionary containing per-view metric dictionaries.
+
+    Returns:
+        Formatted pandas DataFrame for reporting.
+    """
+    rows = []
+
+    # 1. Subject-level metrics
+    metric_specs = [
+        ("Accuracy", "accuracy", True),
+        ("Precision", "precision", True),
+        ("Recall", "recall", True),
+        ("F1-Score", "f1_score", True),
+        ("Specificity", "specificity", True),
+        ("Balanced Accuracy", "balanced_accuracy", True),
+        ("Composite Score", "composite_score", True),
+        ("ROC-AUC", "roc_auc", False),
+        ("Loss", "loss", False),
+    ]
+
+    for display_name, key, is_pct in metric_specs:
+        val = subject_metrics.get(key)
+        base_val = PUBLISHED_TABLE_8_BENCHMARKS.get(display_name)
+        if val is not None:
+            res_str = f"{val * 100:.2f}%" if is_pct else f"{val:.4f}"
+        else:
+            res_str = "N/A"
+
+        if base_val is not None:
+            base_str = f"{base_val * 100:.2f}%" if is_pct else f"{base_val:.4f}"
+            if val is not None:
+                delta = val - base_val
+                delta_sign = "+" if delta >= 0 else ""
+                delta_str = f"{delta_sign}{delta * 100:.2f}%" if is_pct else f"{delta_sign}{delta:.4f}"
+            else:
+                delta_str = "N/A"
+        else:
+            base_str = "N/A"
+            delta_str = "N/A"
+
+        rows.append({
+            "Level": "Subject (Ensemble)",
+            "Metric": display_name,
+            "Result": res_str,
+            "Baseline": base_str,
+            "Delta": delta_str,
+        })
+
+    # 2. View-level metrics
+    for view_name in ["axial", "coronal", "sagittal"]:
+        v_dict = view_metrics.get(view_name, {})
+        for display_name, key, is_pct in metric_specs[:4]:
+            val = v_dict.get(key)
+            res_str = f"{val * 100:.2f}%" if (val is not None and is_pct) else (f"{val:.4f}" if val is not None else "N/A")
+            rows.append({
+                "Level": f"View ({view_name.capitalize()})",
+                "Metric": display_name,
+                "Result": res_str,
+                "Baseline": "N/A",
+                "Delta": "N/A",
+            })
+
+    return pd.DataFrame(rows)
 
 
 def run_evaluation_pipeline(
