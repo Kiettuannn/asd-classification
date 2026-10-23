@@ -76,7 +76,8 @@ def compute_classification_metrics(
     fp = int(np.sum((y_true_np == 0) & (y_pred_np == 1)))
     specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
     balanced_acc = float(0.5 * (rec + specificity))
-    composite = float(0.5 * f1 + 0.5 * balanced_acc)
+    g_mean = float(np.sqrt(max(0.0, rec * specificity)))
+    composite = float(0.5 * balanced_acc + 0.5 * g_mean)
 
     metrics: Dict[str, float] = {
         "accuracy": acc,
@@ -85,6 +86,7 @@ def compute_classification_metrics(
         "f1_score": f1,
         "specificity": specificity,
         "balanced_accuracy": balanced_acc,
+        "g_mean": g_mean,
         "composite_score": composite,
     }
 
@@ -238,8 +240,70 @@ def plot_roc_curve(
     return auc_score, out_file
 
 
+def find_optimal_threshold(
+    y_true: Union[np.ndarray, torch.Tensor],
+    y_prob: Union[np.ndarray, torch.Tensor],
+    min_thresh: float = 0.35,
+    max_thresh: float = 0.65,
+    num_steps: int = 31,
+) -> float:
+    """Find the optimal binary decision threshold maximizing the G-Mean composite score.
+
+    Calibrates decision threshold on validation probabilities to balance Sensitivity (Recall)
+    and Specificity, preventing single-class prediction collapse:
+        threshold^* = argmax_{tau in [min_thresh, max_thresh]} CompositeScore(tau)
+    where CompositeScore = 0.5 * BalancedAccuracy + 0.5 * GMean.
+
+    Args:
+        y_true: Ground-truth binary targets (1=ASD, 0=TC).
+        y_prob: Predicted class probabilities (either (N, 2) or (N,)).
+        min_thresh: Lower search bound for candidate threshold (default: 0.35).
+        max_thresh: Upper search bound for candidate threshold (default: 0.65).
+        num_steps: Number of uniformly spaced candidate threshold steps (default: 31).
+
+    Returns:
+        Optimal decision threshold float. Falls back to 0.5 if inputs are degenerate.
+    """
+    if isinstance(y_true, torch.Tensor):
+        y_true = y_true.detach().cpu().numpy()
+    if isinstance(y_prob, torch.Tensor):
+        y_prob = y_prob.detach().cpu().numpy()
+
+    y_true_np = np.asarray(y_true).astype(int).ravel()
+    y_prob_np = np.asarray(y_prob)
+    if y_prob_np.ndim == 2 and y_prob_np.shape[1] >= 2:
+        scores = y_prob_np[:, 1]
+    else:
+        scores = y_prob_np.ravel()
+
+    if len(y_true_np) == 0 or len(np.unique(y_true_np)) < 2:
+        return 0.5
+
+    thresholds = np.linspace(min_thresh, max_thresh, num_steps)
+    best_thresh = 0.5
+    best_score = -1.0
+    min_dist_to_half = float("inf")
+
+    for tau in thresholds:
+        preds = (scores >= tau).astype(int)
+        metrics = compute_classification_metrics(y_true_np, preds, scores)
+        score = metrics["composite_score"]
+        dist = abs(tau - 0.5)
+
+        if score > best_score + 1e-5:
+            best_score = score
+            best_thresh = float(tau)
+            min_dist_to_half = dist
+        elif abs(score - best_score) <= 1e-5 and dist < min_dist_to_half:
+            best_thresh = float(tau)
+            min_dist_to_half = dist
+
+    return round(best_thresh, 4)
+
+
 def aggregate_soft_voting_probabilities(
     view_probs: Union[Dict[str, np.ndarray], np.ndarray],
+    threshold: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Aggregate multi-view probabilities via soft-voting ensemble.
 
@@ -254,6 +318,7 @@ def aggregate_soft_voting_probabilities(
     Args:
         view_probs: Either a dictionary with keys ('axial', 'coronal', 'sagittal')
             mapping to arrays of shape (N, 2), or a 3D numpy array of shape (N, 3, 2).
+        threshold: Decision threshold for positive class (ASD=1) classification (default: 0.5).
 
     Returns:
         Tuple of (subject_probabilities of shape (N, 2), subject_predictions of shape (N,)).
@@ -268,7 +333,11 @@ def aggregate_soft_voting_probabilities(
 
     # Average along view dimension (axis 1)
     subject_probs = np.mean(prob_stack, axis=1)
-    subject_preds = np.argmax(subject_probs, axis=1)
+    if abs(threshold - 0.5) < 1e-6 and subject_probs.shape[1] == 2:
+        subject_preds = np.argmax(subject_probs, axis=1)
+    else:
+        asd_prob = subject_probs[:, 1] if subject_probs.shape[1] >= 2 else subject_probs.ravel()
+        subject_preds = (asd_prob >= threshold).astype(int)
 
     return subject_probs, subject_preds
 
@@ -278,6 +347,8 @@ def evaluate_multiview_ensemble(
     dataset: Any,
     device: Optional[str] = None,
     criterion: Optional[torch.nn.Module] = None,
+    threshold: Optional[float] = None,
+    calibrate_threshold: bool = True,
 ) -> Dict[str, Any]:
     """Execute dual-level evaluation of 3D-CNN using 3-view soft-voting ensemble.
 
@@ -285,17 +356,21 @@ def evaluate_multiview_ensemble(
     1. Evaluates Axial, Coronal, and Sagittal 50-slice sub-volumes independently.
     2. Computes per-view softmax diagnostic probabilities.
     3. Aggregates per-view probabilities via soft-voting average to derive subject-level diagnosis.
-    4. Computes comprehensive diagnostic metrics at both the Subject Level and View Level.
+    4. Computes comprehensive diagnostic metrics at both Subject Level (at standard and calibrated thresholds) and View Level.
 
     Args:
         model: Trained 3D-CNN model (SEResNet3D or Baseline3DCNN).
         dataset: MultiViewDataset containing subject tensors and labels.
         device: Target execution device ('cuda' or 'cpu').
         criterion: Optional loss function for computing evaluated loss.
+        threshold: Optional custom decision threshold (default: 0.5).
+        calibrate_threshold: Whether to search for and evaluate the optimal threshold tau*.
 
     Returns:
         Dictionary containing:
-        - 'subject_metrics': Subject-level diagnostic metrics dictionary.
+        - 'subject_metrics': Subject-level diagnostic metrics at default threshold.
+        - 'calibrated_metrics': Diagnostic metrics at optimal threshold tau* (if calibrated).
+        - 'optimal_threshold': Calculated optimal decision threshold float.
         - 'view_metrics': Per-view metrics dictionary ('axial', 'coronal', 'sagittal').
         - 'subject_probabilities': Array of shape (N, 2) with ensembled probabilities.
         - 'subject_predictions': Array of shape (N,) with discrete class predictions.
@@ -345,8 +420,9 @@ def evaluate_multiview_ensemble(
     }
     y_true = np.array(labels_list, dtype=np.int64)
 
-    # 1. Subject-level soft voting aggregation
-    subject_probs, subject_preds = aggregate_soft_voting_probabilities(view_probs)
+    # 1. Subject-level soft voting aggregation (default threshold)
+    default_thresh = threshold if threshold is not None else 0.5
+    subject_probs, subject_preds = aggregate_soft_voting_probabilities(view_probs, threshold=default_thresh)
     mean_loss = (total_loss / total_samples) if total_samples > 0 else None
     subject_metrics = compute_classification_metrics(
         y_true=y_true,
@@ -355,7 +431,21 @@ def evaluate_multiview_ensemble(
         loss_value=mean_loss,
     )
 
-    # 2. View-level independent metrics
+    # 2. Optimal threshold calibration (if requested)
+    calibrated_metrics = None
+    opt_thresh = default_thresh
+    if calibrate_threshold:
+        opt_thresh = find_optimal_threshold(y_true, subject_probs)
+        _, calib_preds = aggregate_soft_voting_probabilities(view_probs, threshold=opt_thresh)
+        calibrated_metrics = compute_classification_metrics(
+            y_true=y_true,
+            y_pred=calib_preds,
+            y_prob=subject_probs,
+            loss_value=mean_loss,
+        )
+        calibrated_metrics["threshold"] = opt_thresh
+
+    # 3. View-level independent metrics
     view_metrics = {}
     for v_name in ["axial", "coronal", "sagittal"]:
         v_prob = view_probs[v_name]
@@ -366,14 +456,18 @@ def evaluate_multiview_ensemble(
             y_prob=v_prob,
         )
 
-    return {
+    res = {
         "subject_metrics": subject_metrics,
         "view_metrics": view_metrics,
         "subject_probabilities": subject_probs,
         "subject_predictions": subject_preds,
         "subject_targets": y_true,
         "view_probabilities": view_probs,
+        "optimal_threshold": opt_thresh,
     }
+    if calibrated_metrics is not None:
+        res["calibrated_metrics"] = calibrated_metrics
+    return res
 
 
 def format_dual_level_report(
@@ -403,6 +497,7 @@ def format_dual_level_report(
         ("F1-Score", "f1_score", True),
         ("Specificity", "specificity", True),
         ("Balanced Accuracy", "balanced_accuracy", True),
+        ("G-Mean", "g_mean", True),
         ("Composite Score", "composite_score", True),
         ("ROC-AUC", "roc_auc", False),
         ("Loss", "loss", False),

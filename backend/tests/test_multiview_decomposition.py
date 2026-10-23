@@ -22,6 +22,7 @@ from asd_classification.pipelines.evaluate import (
     aggregate_soft_voting_probabilities,
     compute_classification_metrics,
     evaluate_multiview_ensemble,
+    find_optimal_threshold,
     format_dual_level_report,
 )
 from asd_classification.pipelines.train import EarlyStopping, compute_class_weights
@@ -322,3 +323,33 @@ def test_seresnet3d_and_baseline_with_50_slices_amp():
     assert out_base.shape == (2, 2)
     loss_base = loss_fn(out_base, target)
     loss_base.backward()
+
+
+def test_find_optimal_threshold_and_calibration():
+    """Verify threshold calibration prevents single-class collapse and balances G-Mean."""
+    # Biased probabilities where all samples have P(ASD) > 0.5:
+    # 2 TC subjects with prob 0.52 and 0.54, 2 ASD subjects with prob 0.58 and 0.60
+    y_true = np.array([0, 0, 1, 1])
+    y_prob = np.array([
+        [0.48, 0.52],
+        [0.46, 0.54],
+        [0.42, 0.58],
+        [0.40, 0.60],
+    ])
+
+    # Standard threshold 0.5 predicts all 1s (ASD) -> Specificity = 0%, G-Mean = 0%
+    _, default_preds = aggregate_soft_voting_probabilities(y_prob.reshape(4, 1, 2), threshold=0.5)
+    default_m = compute_classification_metrics(y_true, default_preds, y_prob)
+    assert default_m["specificity"] == 0.0
+    assert default_m["g_mean"] == 0.0
+
+    # Calibrated threshold finds tau* (e.g., 0.56) separating TC and ASD
+    tau_star = find_optimal_threshold(y_true, y_prob)
+    assert 0.54 < tau_star <= 0.58
+
+    _, calib_preds = aggregate_soft_voting_probabilities(y_prob.reshape(4, 1, 2), threshold=tau_star)
+    calib_m = compute_classification_metrics(y_true, calib_preds, y_prob)
+    assert calib_m["specificity"] == 1.0
+    assert calib_m["recall"] == 1.0
+    assert calib_m["g_mean"] == 1.0
+    assert calib_m["composite_score"] == 1.0
