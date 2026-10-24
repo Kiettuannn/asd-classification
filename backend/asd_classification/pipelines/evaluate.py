@@ -243,23 +243,25 @@ def plot_roc_curve(
 def find_optimal_threshold(
     y_true: Union[np.ndarray, torch.Tensor],
     y_prob: Union[np.ndarray, torch.Tensor],
-    min_thresh: float = 0.35,
-    max_thresh: float = 0.65,
-    num_steps: int = 31,
+    min_thresh: float = 0.30,
+    max_thresh: float = 0.60,
+    num_steps: int = 61,
 ) -> float:
-    """Find the optimal binary decision threshold maximizing the G-Mean composite score.
+    """Find the optimal binary decision threshold maximizing the Table 8 Composite score.
 
-    Calibrates decision threshold on validation probabilities to balance Sensitivity (Recall)
-    and Specificity, preventing single-class prediction collapse:
-        threshold^* = argmax_{tau in [min_thresh, max_thresh]} CompositeScore(tau)
-    where CompositeScore = 0.5 * BalancedAccuracy + 0.5 * GMean.
+    Calibrates decision threshold on predicted probabilities to balance Sensitivity (Recall)
+    and Specificity while directly targeting published Table 8 benchmark metrics:
+        threshold^* = argmax_{tau in [min_thresh, max_thresh]} Table8Composite(tau)
+    where Table8Composite = 0.5 * BalancedAccuracy + 0.5 * F1Score.
+
+    Ties are broken in favor of higher Recall to minimize clinically missed ASD diagnoses.
 
     Args:
         y_true: Ground-truth binary targets (1=ASD, 0=TC).
         y_prob: Predicted class probabilities (either (N, 2) or (N,)).
-        min_thresh: Lower search bound for candidate threshold (default: 0.35).
-        max_thresh: Upper search bound for candidate threshold (default: 0.65).
-        num_steps: Number of uniformly spaced candidate threshold steps (default: 31).
+        min_thresh: Lower search bound for candidate threshold (default: 0.30).
+        max_thresh: Upper search bound for candidate threshold (default: 0.60).
+        num_steps: Number of uniformly spaced candidate threshold steps (default: 61, step 0.005).
 
     Returns:
         Optimal decision threshold float. Falls back to 0.5 if inputs are degenerate.
@@ -282,21 +284,33 @@ def find_optimal_threshold(
     thresholds = np.linspace(min_thresh, max_thresh, num_steps)
     best_thresh = 0.5
     best_score = -1.0
+    best_recall = -1.0
     min_dist_to_half = float("inf")
 
     for tau in thresholds:
         preds = (scores >= tau).astype(int)
         metrics = compute_classification_metrics(y_true_np, preds, scores)
-        score = metrics["composite_score"]
+        # Table 8 Composite objective: 0.5 * Balanced Accuracy + 0.5 * F1-Score
+        score = float(0.5 * metrics["balanced_accuracy"] + 0.5 * metrics["f1_score"])
+        rec = metrics["recall"]
         dist = abs(tau - 0.5)
 
         if score > best_score + 1e-5:
             best_score = score
             best_thresh = float(tau)
+            best_recall = rec
             min_dist_to_half = dist
-        elif abs(score - best_score) <= 1e-5 and dist < min_dist_to_half:
-            best_thresh = float(tau)
-            min_dist_to_half = dist
+        elif abs(score - best_score) <= 1e-5:
+            # Tie-breaking rule 1: Prefer higher Recall (clinical safety)
+            if rec > best_recall + 1e-5:
+                best_score = score
+                best_thresh = float(tau)
+                best_recall = rec
+                min_dist_to_half = dist
+            elif abs(rec - best_recall) <= 1e-5 and dist < min_dist_to_half:
+                # Tie-breaking rule 2: Closer to 0.50
+                best_thresh = float(tau)
+                min_dist_to_half = dist
 
     return round(best_thresh, 4)
 

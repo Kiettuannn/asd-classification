@@ -353,3 +353,17 @@ def test_find_optimal_threshold_and_calibration():
     assert calib_m["recall"] == 1.0
     assert calib_m["g_mean"] == 1.0
     assert calib_m["composite_score"] == 1.0
+
+
+def test_find_optimal_threshold_tie_breaking_and_table8_composite():
+    """Verify Table 8 composite optimization and deterministic tie-breaking (Recall then distance to 0.5)."""
+    # Degenerate inputs fall back to 0.5
+    assert find_optimal_threshold(np.array([]), np.array([])) == 0.5
+    assert find_optimal_threshold(np.array([0, 0]), np.array([0.2, 0.3])) == 0.5
+
+    # Plateau where all tau <= 0.40 yield identical predictions [1, 1] with Recall=1.0 and Table 8 Composite=0.5833.
+    # Tie-breaking rule 2 must select the candidate closest to 0.50, which is 0.40.
+    y_true = np.array([0, 1])
+    y_prob = np.array([[0.6, 0.4], [0.6, 0.4]])
+    tau = find_optimal_threshold(y_true, y_prob, min_thresh=0.30, max_thresh=0.60, num_steps=61)
+    assert abs(tau - 0.40) < 1e-4
