@@ -18,13 +18,18 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from asd_classification.data.loader import MultiViewDataset
+from asd_classification.data.loader import MultiViewDataset, TriSliceDataset
 from asd_classification.data.split import get_kfold_splits
-from asd_classification.models.baseline.augmentation import VolumeConsistentAugmenter
+from asd_classification.models.baseline.augmentation import (
+    BagConsistentAugmenter,
+    VolumeConsistentAugmenter,
+)
 from asd_classification.models.baseline.cnn3d import Baseline3DCNN, SEResNet3D
 from asd_classification.models.baseline.focal_loss import FocalLoss
+from asd_classification.models.baseline.resnet_mil import ResNet18MIL
 from asd_classification.pipelines.evaluate import (
     compute_classification_metrics,
+    evaluate_mil_model,
     evaluate_multiview_ensemble,
 )
 
@@ -61,6 +66,130 @@ def compute_cosine_warmup_lr(
     progress = min(max(progress, 0.0), 1.0)
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     return float(min_lr + (peak_lr - min_lr) * cosine_decay)
+
+
+def compute_differential_cosine_warmup_lr(
+    epoch: int,
+    base_lr: float,
+    warmup_epochs: int = 3,
+    max_epochs: int = 100,
+    min_lr: float = 1e-6,
+    start_lr: Optional[float] = None,
+) -> float:
+    """Compute scheduled learning rate for a specific parameter group across epochs.
+
+    Implements a linear warmup over `warmup_epochs` followed by Cosine Annealing
+    decay down to `min_lr` at `max_epochs`.
+
+    Args:
+        epoch: Current 1-based training epoch (1 <= epoch <= max_epochs).
+        base_lr: Peak target learning rate reached at the end of the warmup phase.
+        warmup_epochs: Number of linear warmup epochs (default: 3).
+        max_epochs: Total optimization epochs (default: 100).
+        min_lr: Minimum learning rate floor at terminal epoch (default: 1e-6).
+        start_lr: Initial learning rate at epoch 1. If None, defaults to base_lr * 0.1.
+
+    Returns:
+        Scheduled learning rate float value.
+    """
+    if start_lr is None:
+        start_lr = base_lr * 0.1
+
+    if epoch <= warmup_epochs:
+        if warmup_epochs <= 1:
+            return float(base_lr)
+        alpha = (epoch - 1) / float(warmup_epochs - 1)
+        return float(start_lr + alpha * (base_lr - start_lr))
+
+    progress = (epoch - warmup_epochs) / float(max(max_epochs - warmup_epochs, 1))
+    progress = min(max(progress, 0.0), 1.0)
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(min_lr + (base_lr - min_lr) * cosine_decay)
+
+
+def configure_differential_optimizer(
+    model: nn.Module,
+    backbone_lr: float = 1e-5,
+    head_lr: float = 1e-4,
+    backbone_weight_decay: float = 1e-4,
+    head_weight_decay: float = 1e-3,
+) -> torch.optim.Adam:
+    """Configure Adam optimizer with differential learning rates for ResNet-18 MIL.
+
+    Assigns a low learning rate (1e-5) to deep backbone stages (layer3, layer4)
+    and a higher rate (1e-4) to the Gated Attention module and classification head.
+    Excludes frozen early stages (conv1, bn1, layer1, layer2).
+
+    Args:
+        model: ResNet18MIL network instance.
+        backbone_lr: Fine-tuning learning rate for ResNet backbone (default: 1e-5).
+        head_lr: Learning rate for attention pooling and classification head (default: 1e-4).
+        backbone_weight_decay: L2 regularization factor for backbone (default: 1e-4).
+        head_weight_decay: L2 regularization factor for heads (default: 1e-3).
+
+    Returns:
+        Configured torch.optim.Adam optimizer instance.
+    """
+    param_fn = getattr(model, "get_parameter_groups", None)
+    if callable(param_fn):
+        param_groups = param_fn(
+            backbone_lr=backbone_lr,
+            head_lr=head_lr,
+            backbone_weight_decay=backbone_weight_decay,
+            head_weight_decay=head_weight_decay,
+        )
+    else:
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        param_groups = [
+            {
+                "params": trainable,
+                "lr": head_lr,
+                "weight_decay": head_weight_decay,
+                "name": "all_trainable",
+            }
+        ]
+
+    for group in param_groups:
+        group["initial_lr"] = float(group["lr"])
+        group["base_lr"] = float(group["lr"])
+
+    return torch.optim.Adam(param_groups)
+
+
+def update_learning_rates(
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    warmup_epochs: int = 3,
+    max_epochs: int = 100,
+    min_lr: float = 1e-6,
+) -> Dict[str, float]:
+    """Update learning rates for all parameter groups in the optimizer for the given epoch.
+
+    Args:
+        optimizer: PyTorch optimizer with one or more parameter groups.
+        epoch: Current 1-based training epoch.
+        warmup_epochs: Number of linear warmup epochs (default: 3).
+        max_epochs: Total optimization epochs (default: 100).
+        min_lr: Minimum learning rate floor (default: 1e-6).
+
+    Returns:
+        Dictionary mapping parameter group name (or index string) to updated learning rate.
+    """
+    updated: Dict[str, float] = {}
+    for idx, group in enumerate(optimizer.param_groups):
+        base_lr = float(group.get("base_lr", group.get("initial_lr", group["lr"])))
+        group_min_lr = min(min_lr, base_lr)
+        group_lr = compute_differential_cosine_warmup_lr(
+            epoch=epoch,
+            base_lr=base_lr,
+            warmup_epochs=warmup_epochs,
+            max_epochs=max_epochs,
+            min_lr=group_min_lr,
+        )
+        group["lr"] = group_lr
+        group_name = str(group.get("name", f"group_{idx}"))
+        updated[group_name] = group_lr
+    return updated
 
 
 class EarlyStopping:
@@ -190,6 +319,8 @@ def train_epoch(
     amp_enabled = (torch.device(device).type == "cuda") and (scaler is not None)
 
     for step_idx, (inputs, targets) in enumerate(dataloader):
+        if augmenter is not None:
+            inputs = augmenter(inputs)
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         batch_size = inputs.size(0)
@@ -197,12 +328,14 @@ def train_epoch(
         # Forward pass with AMP when GPU is available
         if amp_enabled and scaler is not None:
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(inputs)
+                outputs = model(inputs)
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
                 loss = criterion(logits, targets)
                 scaled_loss = loss / accumulation_steps
             scaler.scale(scaled_loss).backward()
         else:
-            logits = model(inputs)
+            outputs = model(inputs)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
             loss = criterion(logits, targets)
             scaled_loss = loss / accumulation_steps
             scaled_loss.backward()
@@ -217,6 +350,95 @@ def train_epoch(
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                optimizer.step()
+            optimizer.zero_grad()
+
+    return total_loss / max(total_samples, 1)
+
+
+def train_mil_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    accumulation_steps: int = 4,
+    device: str = "cpu",
+    max_norm: float = 1.0,
+    augmenter: Optional[nn.Module] = None,
+) -> float:
+    """Execute one training epoch for ResNet-18 MIL with gradient accumulation and clipping.
+
+    Computes label-smoothed cross-entropy loss over patient bags of 2.5D tri-slices,
+    accumulates gradients over `accumulation_steps`, clips gradients to `max_norm` to
+    prevent gradient explosion, and updates parameters.
+
+    Args:
+        model: PyTorch MIL model (e.g. ResNet18MIL).
+        dataloader: Training DataLoader yielding (bag_tensor, target_tensor).
+        optimizer: Differential optimizer (e.g. Adam with parameter groups).
+        criterion: Loss module (e.g. nn.CrossEntropyLoss(label_smoothing=0.1)).
+        scaler: Optional GradScaler for Automatic Mixed Precision.
+        accumulation_steps: Number of batches over which gradients are accumulated (default: 4).
+        device: Target execution device ('cuda' or 'cpu').
+        max_norm: Maximum norm for gradient clipping (default: 1.0).
+        augmenter: Optional data augmentation transform module.
+
+    Returns:
+        Average training loss over the epoch.
+
+    Raises:
+        FloatingPointError: If loss evaluates to NaN or Inf during training.
+    """
+    model.train()
+    if augmenter is not None:
+        augmenter.train()
+
+    total_loss = 0.0
+    total_samples = 0
+    optimizer.zero_grad()
+
+    amp_enabled = (torch.device(device).type == "cuda") and (scaler is not None)
+
+    for step_idx, (inputs, targets) in enumerate(dataloader):
+        if augmenter is not None:
+            inputs = augmenter(inputs)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        batch_size = inputs.size(0)
+
+        if amp_enabled and scaler is not None:
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(inputs)
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                loss = criterion(logits, targets)
+                if torch.isnan(loss) or torch.isinf(loss):
+                    raise FloatingPointError("Loss exploded to NaN or Inf during MIL training step.")
+                scaled_loss = loss / accumulation_steps
+            scaler.scale(scaled_loss).backward()
+        else:
+            outputs = model(inputs)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            loss = criterion(logits, targets)
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise FloatingPointError("Loss exploded to NaN or Inf during MIL training step.")
+            scaled_loss = loss / accumulation_steps
+            scaled_loss.backward()
+
+        total_loss += float(loss.item()) * batch_size
+        total_samples += batch_size
+
+        is_accumulation_step = ((step_idx + 1) % accumulation_steps == 0) or (step_idx + 1 == len(dataloader))
+        if is_accumulation_step:
+            if amp_enabled and scaler is not None:
+                scaler.unscale_(optimizer)
+                if max_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if max_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 optimizer.step()
             optimizer.zero_grad()
 
@@ -254,7 +476,8 @@ def evaluate_epoch(
             targets = targets.to(device, non_blocking=True)
             batch_size = inputs.size(0)
 
-            logits = model(inputs)
+            outputs = model(inputs)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
             loss = criterion(logits, targets)
 
             probs = torch.softmax(logits, dim=-1)
@@ -403,6 +626,165 @@ def train_3dcnn_model(
         "model": model,
         "history": history,
         "best_metrics": best_metrics,
+        "stopped_epoch": len(history["train_loss"]),
+    }
+
+
+def train_mil_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: Optional[nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    epochs: int = 100,
+    accumulation_steps: int = 4,
+    early_stopping_patience: int = 15,
+    early_stopping_metric: str = "composite_score",
+    early_stopping_mode: str = "max",
+    warmup_epochs: int = 3,
+    min_lr: float = 1e-6,
+    checkpoint_path: Optional[Union[str, Path]] = None,
+    device: Optional[str] = None,
+    use_amp: bool = True,
+    augmenter: Optional[nn.Module] = None,
+    max_norm: float = 1.0,
+) -> Dict[str, Any]:
+    """Train 2.5D ResNet-18 MIL network with differential LR, cosine warmup, and early stopping.
+
+    Args:
+        model: ResNet18MIL network instance.
+        train_loader: Training DataLoader delivering bags of tri-slices.
+        val_loader: Validation DataLoader delivering bags of tri-slices.
+        criterion: Loss function (defaults to CrossEntropyLoss with label_smoothing=0.1).
+        optimizer: Optimizer with parameter groups (defaults to configure_differential_optimizer).
+        epochs: Maximum training epochs (default: 100).
+        accumulation_steps: Gradient accumulation steps (default: 4).
+        early_stopping_patience: Number of epochs without improvement before stopping (default: 15).
+        early_stopping_metric: Validation metric to monitor (default: 'composite_score').
+        early_stopping_mode: Optimization direction ('max' or 'min').
+        warmup_epochs: Linear warmup epochs (default: 3).
+        min_lr: Floor learning rate at final epoch (default: 1e-6).
+        checkpoint_path: Optional destination path for saving best model weights.
+        device: Target execution device ('cuda' or 'cpu').
+        use_amp: Enable Automatic Mixed Precision if GPU is available.
+        augmenter: Optional bag-level data augmentation module.
+        max_norm: Maximum gradient norm clipping threshold (default: 1.0).
+
+    Returns:
+        Dictionary containing:
+        - 'model': Model instance with best weights restored.
+        - 'history': Training and validation metric trajectories across epochs.
+        - 'best_metrics': Highest validation metrics achieved at best epoch.
+        - 'optimal_threshold': Optimal decision threshold calibrated at best epoch.
+        - 'calibrated_metrics': Calibrated metrics at optimal threshold at best epoch.
+        - 'stopped_epoch': Terminal epoch index reached during training.
+    """
+    exec_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(exec_device)
+
+    opt = optimizer or configure_differential_optimizer(
+        model=model,
+        backbone_lr=1e-5,
+        head_lr=1e-4,
+        backbone_weight_decay=1e-4,
+        head_weight_decay=1e-3,
+    )
+    loss_fn = criterion or nn.CrossEntropyLoss(label_smoothing=0.1)
+    scaler = torch.amp.GradScaler("cuda") if (torch.device(exec_device).type == "cuda" and use_amp) else None
+    early_stopping = EarlyStopping(
+        patience=early_stopping_patience,
+        min_delta=1e-4,
+        mode=early_stopping_mode,
+        checkpoint_path=checkpoint_path,
+        warmup_epochs=warmup_epochs,
+    )
+
+    history: Dict[str, List[Any]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "val_f1": [],
+        "val_composite_score": [],
+        "learning_rates": [],
+    }
+
+    best_metrics: Dict[str, float] = {}
+    best_eval_res: Dict[str, Any] = {}
+
+    for epoch in range(1, epochs + 1):
+        current_lrs = update_learning_rates(
+            optimizer=opt,
+            epoch=epoch,
+            warmup_epochs=warmup_epochs,
+            max_epochs=epochs,
+            min_lr=min_lr,
+        )
+
+        train_loss_val = train_mil_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=opt,
+            criterion=loss_fn,
+            scaler=scaler,
+            accumulation_steps=accumulation_steps,
+            device=exec_device,
+            max_norm=max_norm,
+            augmenter=augmenter,
+        )
+
+        eval_res = evaluate_mil_model(
+            model=model,
+            dataloader=val_loader,
+            criterion=loss_fn,
+            device=exec_device,
+            calibrate_threshold=True,
+        )
+        val_metrics = eval_res["metrics"]
+        calibrated_metrics = eval_res.get("calibrated_metrics", val_metrics)
+        val_loss_val = float(val_metrics.get("loss", 0.0))
+
+        history["train_loss"].append(train_loss_val)
+        history["val_loss"].append(val_loss_val)
+        history["val_accuracy"].append(val_metrics["accuracy"])
+        history["val_f1"].append(val_metrics["f1_score"])
+        history["val_composite_score"].append(val_metrics.get("composite_score", val_metrics["f1_score"]))
+        history["learning_rates"].append(current_lrs)
+
+        if early_stopping_mode == "max":
+            monitored_val = calibrated_metrics.get(
+                early_stopping_metric,
+                val_metrics.get(
+                    early_stopping_metric,
+                    val_metrics.get("composite_score", val_metrics["accuracy"]),
+                ),
+            )
+        else:
+            monitored_val = val_loss_val
+
+        if early_stopping(val_score=monitored_val, model=model, epoch=epoch):
+            break
+        elif early_stopping.counter == 0:
+            best_metrics = val_metrics
+            best_eval_res = eval_res
+
+    if checkpoint_path is not None and Path(checkpoint_path).is_file():
+        load_fn = getattr(model, "load", None)
+        if callable(load_fn):
+            load_fn(checkpoint_path)
+        else:
+            ckpt_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if isinstance(ckpt_dict, dict) and "state_dict" in ckpt_dict:
+                model.load_state_dict(ckpt_dict["state_dict"])
+            elif isinstance(ckpt_dict, dict):
+                model.load_state_dict(ckpt_dict)
+        model.to(exec_device)
+
+    return {
+        "model": model,
+        "history": history,
+        "best_metrics": best_metrics,
+        "optimal_threshold": best_eval_res.get("optimal_threshold", 0.50),
+        "calibrated_metrics": best_eval_res.get("calibrated_metrics", best_metrics),
         "stopped_epoch": len(history["train_loss"]),
     }
 
@@ -666,6 +1048,65 @@ def run_training_pipeline(
             early_stopping_mode="max",
             warmup_epochs=warmup_epochs,
             checkpoint_path=ckpt,
+            **kwargs,
+        )
+
+    if model_type.lower() in ("resnet_mil", "resnet18_mil", "mil", "resnet18"):
+        manifest_path = kwargs.pop("manifest_path", "output/abide_nyu_multiview/metadata.csv")
+        tensors_dir = kwargs.pop("tensors_dir", "output/abide_nyu_multiview/tensors")
+        slices_per_view = kwargs.pop("slices_per_view", 50)
+        central_slices = kwargs.pop("central_slices", 40)
+        stride = kwargs.pop("stride", 2)
+        pretrained = kwargs.pop("pretrained", True)
+        freeze_early = kwargs.pop("freeze_early", True)
+        augmenter = kwargs.pop("transform", BagConsistentAugmenter())
+        epochs = kwargs.pop("epochs", 100)
+        min_lr = kwargs.pop("min_lr", 1e-6)
+
+        mil_train_ds = TriSliceDataset(
+            manifest=manifest_path,
+            tensors_dir=tensors_dir,
+            split="train",
+            transform=augmenter,
+            slices_per_view=slices_per_view,
+            central_slices=central_slices,
+            stride=stride,
+        )
+        mil_test_ds = TriSliceDataset(
+            manifest=manifest_path,
+            tensors_dir=tensors_dir,
+            split="test",
+            transform=None,
+            slices_per_view=slices_per_view,
+            central_slices=central_slices,
+            stride=stride,
+        )
+
+        train_loader_mil = DataLoader(mil_train_ds, batch_size=batch_size, shuffle=True)
+        test_loader_mil = DataLoader(mil_test_ds, batch_size=batch_size, shuffle=False)
+
+        mil_model = ResNet18MIL(pretrained=pretrained, freeze_early=freeze_early)
+        ckpt_name = "best_resnet18_mil.pt"
+        ckpt = Path(f"artifacts/models/{ckpt_name}") if save_checkpoint else None
+
+        criterion = kwargs.pop("criterion", nn.CrossEntropyLoss(label_smoothing=label_smoothing))
+        optimizer = kwargs.pop("optimizer", None)
+
+        return train_mil_model(
+            model=mil_model,
+            train_loader=train_loader_mil,
+            val_loader=test_loader_mil,
+            criterion=criterion,
+            optimizer=optimizer,
+            epochs=epochs,
+            accumulation_steps=accumulation_steps,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_metric="composite_score",
+            early_stopping_mode="max",
+            warmup_epochs=warmup_epochs,
+            min_lr=min_lr,
+            checkpoint_path=ckpt,
+            augmenter=augmenter,
             **kwargs,
         )
 

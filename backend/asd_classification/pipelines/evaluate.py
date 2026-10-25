@@ -6,7 +6,7 @@ Hammash & Younis (MDPI Journal of Imaging, 2026, 12, 109).
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -78,6 +78,7 @@ def compute_classification_metrics(
     balanced_acc = float(0.5 * (rec + specificity))
     g_mean = float(np.sqrt(max(0.0, rec * specificity)))
     composite = float(0.5 * balanced_acc + 0.5 * g_mean)
+    table8_composite = float(0.5 * balanced_acc + 0.5 * f1)
 
     metrics: Dict[str, float] = {
         "accuracy": acc,
@@ -88,6 +89,7 @@ def compute_classification_metrics(
         "balanced_accuracy": balanced_acc,
         "g_mean": g_mean,
         "composite_score": composite,
+        "table8_composite": table8_composite,
     }
 
     if loss_value is not None:
@@ -481,6 +483,133 @@ def evaluate_multiview_ensemble(
     }
     if calibrated_metrics is not None:
         res["calibrated_metrics"] = calibrated_metrics
+    return res
+
+
+def evaluate_mil_model(
+    model: torch.nn.Module,
+    dataloader: Any,
+    criterion: Optional[torch.nn.Module] = None,
+    device: Optional[str] = None,
+    threshold: Optional[float] = 0.50,
+    calibrate_threshold: bool = True,
+) -> Dict[str, Any]:
+    """Execute evaluation for 2.5D ResNet-18 MIL model.
+
+    Evaluates a trained MIL network across patient bags:
+    1. Computes predictions, class probabilities, and diagnostic loss.
+    2. Extracts slice-level attention weights for anatomical interpretability.
+    3. Evaluates diagnostic metrics (accuracy, precision, recall, f1, specificity,
+       balanced accuracy, composite score, loss, roc_auc) at standard threshold (tau=0.50).
+    4. Calibrates optimal decision threshold tau* in [0.30, 0.60] maximizing Table 8
+       composite score with Recall-priority tie-breaking.
+
+    Args:
+        model: Trained MIL model (e.g. ResNet18MIL).
+        dataloader: Evaluation DataLoader or Dataset yielding (bag_tensors, target_tensors).
+        criterion: Optional loss module (e.g. nn.CrossEntropyLoss).
+        device: Target execution device ('cuda' or 'cpu').
+        threshold: Standard decision threshold (default: 0.50).
+        calibrate_threshold: Boolean flag whether to search for optimal threshold tau*.
+
+    Returns:
+        Dictionary containing:
+        - 'metrics': Diagnostic metrics dictionary at standard decision threshold.
+        - 'calibrated_metrics': Diagnostic metrics at calibrated optimal threshold tau*.
+        - 'optimal_threshold': Optimal decision threshold float.
+        - 'attention_weights': Numpy array of shape (N, K) with slice attention weights.
+        - 'probabilities': Numpy array of shape (N, 2) with predicted class probabilities.
+        - 'predictions': Discrete binary predictions at standard threshold.
+        - 'calibrated_predictions': Discrete binary predictions at calibrated threshold.
+        - 'targets': Ground-truth binary labels array.
+        - 'loss': Average evaluated loss value.
+    """
+    exec_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(exec_device)
+    model.eval()
+
+    if isinstance(dataloader, torch.utils.data.DataLoader):
+        eval_dataloader = dataloader
+    else:
+        eval_dataloader = torch.utils.data.DataLoader(dataloader, batch_size=4, shuffle=False)
+
+    all_targets: List[np.ndarray] = []
+    all_probs: List[np.ndarray] = []
+    all_attns: List[np.ndarray] = []
+    total_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for inputs, targets in eval_dataloader:
+            inputs = inputs.to(exec_device, non_blocking=True)
+            targets = targets.to(exec_device, non_blocking=True)
+            batch_size = inputs.size(0)
+
+            outputs = model(inputs)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+                if len(outputs) > 1 and outputs[1] is not None:
+                    all_attns.append(outputs[1].detach().cpu().numpy())
+            else:
+                logits = outputs
+
+            probs = F.softmax(logits, dim=-1)
+
+            if criterion is not None:
+                loss_val = criterion(logits, targets)
+                total_loss += float(loss_val.item()) * batch_size
+                total_samples += batch_size
+
+            all_targets.append(targets.detach().cpu().numpy())
+            all_probs.append(probs.detach().cpu().numpy())
+
+    y_true = np.concatenate(all_targets) if all_targets else np.array([], dtype=int)
+    y_prob = np.concatenate(all_probs) if all_probs else np.empty((0, 2), dtype=float)
+    attention_matrix = np.concatenate(all_attns) if all_attns else np.empty((0, 0), dtype=float)
+
+    mean_loss = (total_loss / max(total_samples, 1)) if total_samples > 0 else 0.0
+
+    default_thresh = float(threshold if threshold is not None else 0.50)
+    scores = y_prob[:, 1] if (y_prob.ndim == 2 and y_prob.shape[1] >= 2) else y_prob.ravel()
+    preds_standard = (scores >= default_thresh).astype(int)
+
+    standard_metrics = compute_classification_metrics(
+        y_true=y_true,
+        y_pred=preds_standard,
+        y_prob=y_prob,
+        loss_value=mean_loss,
+    )
+    standard_metrics["threshold"] = default_thresh
+
+    optimal_threshold = default_thresh
+    calibrated_metrics = None
+    calib_preds = preds_standard
+
+    if calibrate_threshold:
+        optimal_threshold = find_optimal_threshold(y_true, y_prob, min_thresh=0.30, max_thresh=0.60)
+        calib_preds = (scores >= optimal_threshold).astype(int)
+        calibrated_metrics = compute_classification_metrics(
+            y_true=y_true,
+            y_pred=calib_preds,
+            y_prob=y_prob,
+            loss_value=mean_loss,
+        )
+        calibrated_metrics["threshold"] = optimal_threshold
+
+    res: Dict[str, Any] = {
+        "metrics": standard_metrics,
+        "optimal_threshold": optimal_threshold,
+        "attention_weights": attention_matrix,
+        "probabilities": y_prob,
+        "predictions": preds_standard,
+        "targets": y_true,
+        "loss": mean_loss,
+    }
+
+    if calibrated_metrics is not None:
+        res["calibrated_metrics"] = calibrated_metrics
+        res["calibrated_predictions"] = calib_preds
+
     return res
 
 
