@@ -7,11 +7,12 @@ in accordance with ADR-0003 and Hammash & Younis (MDPI Journal of Imaging, 2026)
 
 import json
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import nibabel as nib
 import scipy.ndimage as ndi
+import torch
 
 
 def trim_temporal_frames(
@@ -534,4 +535,116 @@ def export_dataset_manifest(
         json.dump(kaggle_metadata, f, indent=2)
 
     return csv_path, json_path
+
+
+def extract_tri_slices(
+    volume: Union[torch.Tensor, np.ndarray],
+    slices_per_view: int = 50,
+    central_slices: int = 40,
+    stride: int = 2,
+) -> torch.Tensor:
+    """Extract consecutive 2.5D tri-slices across axial, coronal, and sagittal planes.
+
+    Transforms a multi-view fMRI volumetric tensor into a patient bag of 2.5D tri-slices
+    mapping adjacent depth slices [z-1, z, z+1] into 3 RGB-like channels. For a standard
+    (1, 150, 224, 224) volume, sampling with stride 2 across the central 40 slices of
+    each 50-slice orthogonal view produces exactly 60 tri-slices (20 axial, 20 coronal,
+    20 sagittal) of shape (60, 3, 224, 224).
+
+    Local through-plane spatial gradients are preserved by grouping [z-1, z, z+1],
+    enabling standard 2D convolutional networks (such as ResNet-18) to leverage 3D
+    spatial context while avoiding full 3D convolutional parameter explosion.
+
+    Args:
+        volume: Input volumetric tensor of shape (1, D, H, W), (D, H, W), or (B, 1, D, H, W).
+        slices_per_view: Number of depth slices per orthogonal plane (default: 50).
+        central_slices: Number of central slices to sample from each plane (default: 40).
+        stride: Stride between sampled slice centers (default: 2).
+
+    Returns:
+        Extracted bag tensor of shape (K, 3, H, W) for single-subject volumes or
+        (B, K, 3, H, W) for batched volumes, where K = 3 * (central_slices // stride).
+
+    Raises:
+        ValueError: If tensor dimension is not 3D, 4D, or 5D.
+        ValueError: If total depth does not equal 3 * slices_per_view.
+        ValueError: If margin does not permit [z-1, z, z+1] extraction within view bounds.
+    """
+    is_batched = False
+    if isinstance(volume, np.ndarray):
+        tensor_vol = torch.from_numpy(volume).float()
+    else:
+        tensor_vol = volume.float()
+
+    if tensor_vol.ndim == 3:
+        # (D, H, W) -> (1, D, H, W)
+        tensor_vol = tensor_vol.unsqueeze(0)
+    elif tensor_vol.ndim == 4:
+        # (C, D, H, W) - expect single channel C=1
+        if tensor_vol.size(0) != 1:
+            raise ValueError(
+                f"Expected single modality channel (C=1), received shape {tuple(tensor_vol.shape)}"
+            )
+    elif tensor_vol.ndim == 5:
+        # (B, C, D, H, W)
+        if tensor_vol.size(1) != 1:
+            raise ValueError(
+                f"Expected single modality channel (C=1) in batch, received shape {tuple(tensor_vol.shape)}"
+            )
+        is_batched = True
+    else:
+        raise ValueError(
+            f"Expected 3D, 4D, or 5D input tensor, received dimension {tensor_vol.ndim} "
+            f"with shape {tuple(tensor_vol.shape)}"
+        )
+
+    depth_dim = 2 if is_batched else 1
+    total_depth = tensor_vol.shape[depth_dim]
+    expected_depth = 3 * slices_per_view
+    if total_depth != expected_depth:
+        raise ValueError(
+            f"Total depth ({total_depth}) does not match 3 views of {slices_per_view} "
+            f"slices (expected {expected_depth})."
+        )
+
+    if central_slices > slices_per_view:
+        raise ValueError(
+            f"central_slices ({central_slices}) cannot exceed slices_per_view ({slices_per_view})."
+        )
+
+    margin = (slices_per_view - central_slices) // 2
+    if margin < 1:
+        raise ValueError(
+            f"Margin ({margin}) must be at least 1 to safely extract z-1 without cross-plane boundary underflow."
+        )
+
+    # Compute sampled center indices across all 3 orthogonal planes
+    centers: List[int] = []
+    for view_idx in range(3):
+        view_start = view_idx * slices_per_view
+        for z_local in range(margin, margin + central_slices, stride):
+            # Guard against slice boundary overflow
+            if z_local + 1 >= slices_per_view:
+                raise ValueError(
+                    f"Slice index z+1 ({z_local + 1}) exceeds view boundary ({slices_per_view})."
+                )
+            centers.append(view_start + z_local)
+
+    # Build index matrix for [z-1, z, z+1] tri-slice grouping of shape (K, 3)
+    tri_indices = [[c - 1, c, c + 1] for c in centers]
+    indices_tensor = torch.tensor(tri_indices, dtype=torch.long, device=tensor_vol.device)
+
+    if is_batched:
+        # tensor_vol is (B, 1, D, H, W) -> squeeze C=1 to (B, D, H, W)
+        vol_squeezed = tensor_vol.squeeze(1)
+        # Advance index along depth dimension: shape (B, K, 3, H, W)
+        bag = vol_squeezed[:, indices_tensor]
+    else:
+        # tensor_vol is (1, D, H, W) -> squeeze C=1 to (D, H, W)
+        vol_squeezed = tensor_vol.squeeze(0)
+        # Index along depth dimension: shape (K, 3, H, W)
+        bag = vol_squeezed[indices_tensor]
+
+    return bag.contiguous()
+
 

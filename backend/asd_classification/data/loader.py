@@ -8,6 +8,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from asd_classification.preprocessing.multiview import extract_tri_slices
+
 
 @dataclass
 class CohortRecord:
@@ -360,3 +362,195 @@ class MultiViewDataset(Dataset):
         views_dict, label = self.get_subject_views(subject_idx)
         stacked = torch.stack([views_dict["axial"], views_dict["coronal"], views_dict["sagittal"]], dim=0)
         return stacked, label
+
+
+class TriSliceDataset(Dataset):
+    """PyTorch Dataset for multi-view 2.5D tri-slice patient bags for MIL.
+
+    Extracts patient bags of exactly 60 tri-slices of shape (60, 3, 224, 224)
+    (20 axial, 20 coronal, 20 sagittal) from depth-stacked multi-view fMRI
+    volumetric tensors of shape (1, 150, 224, 224).
+
+    Adjacent depth slices [z-1, z, z+1] are grouped into 3 channels to encode
+    local 3D through-plane spatial gradients for 2D convolutional backbones
+    such as ResNet-18 without 3D parameter explosion.
+    """
+
+    def __init__(
+        self,
+        manifest: Union[pd.DataFrame, str, Path],
+        tensors_dir: Optional[Union[str, Path]] = None,
+        split: Optional[str] = None,
+        transform: Optional[Any] = None,
+        cache_tensors: bool = False,
+        slices_per_view: int = 50,
+        central_slices: int = 40,
+        stride: int = 2,
+    ) -> None:
+        """Initialize TriSliceDataset.
+
+        Args:
+            manifest: DataFrame or path to metadata.csv containing subject records and splits.
+            tensors_dir: Optional root directory containing .npz tensor files.
+            split: Optional split filter: 'train', 'test', or None/'all'.
+            transform: Optional bag-level transformation module (e.g. BagConsistentAugmenter).
+            cache_tensors: Boolean flag enabling in-memory tensor caching after initial read.
+            slices_per_view: Slice count per orthogonal plane (default: 50).
+            central_slices: Number of central slices to sample from each plane (default: 40).
+            stride: Step size between sampled slice centers (default: 2).
+
+        Raises:
+            TypeError: If manifest is not a DataFrame, str, or Path.
+            ValueError: If split filtering is requested but manifest lacks a 'split' column.
+        """
+        self._manifest_dir: Optional[Path]
+        if isinstance(manifest, (str, Path)):
+            manifest_path = Path(manifest)
+            self.manifest_df = pd.read_csv(manifest_path)
+            self._manifest_dir = manifest_path.parent
+        elif isinstance(manifest, pd.DataFrame):
+            self.manifest_df = manifest.copy()
+            self._manifest_dir = None
+        else:
+            raise TypeError(f"Expected DataFrame or path, got {type(manifest)}")
+
+        # Filter by split if requested
+        if split is not None and split.lower() not in ("all", "none"):
+            if "split" not in self.manifest_df.columns:
+                raise ValueError("Cannot filter by split when 'split' column is not in manifest.")
+            self.manifest_df = self.manifest_df[
+                self.manifest_df["split"] == split.lower()
+            ].reset_index(drop=True)
+        else:
+            self.manifest_df = self.manifest_df.reset_index(drop=True)
+
+        self.tensors_dir = Path(tensors_dir) if tensors_dir is not None else None
+        self.split = split
+        self.transform = transform
+        self.cache_tensors = cache_tensors
+        self.slices_per_view = slices_per_view
+        self.central_slices = central_slices
+        self.stride = stride
+        self._tensor_cache: Dict[str, np.ndarray] = {}
+
+        # Automatically ensure evaluation mode for test or validation splits
+        if self.split in ("test", "val", "validation") and isinstance(self.transform, torch.nn.Module):
+            self.transform.eval()
+
+    def __len__(self) -> int:
+        """Return the number of subjects in the dataset.
+
+        Returns:
+            Total subject count within the active split.
+        """
+        return len(self.manifest_df)
+
+    def _resolve_tensor_file(self, row: pd.Series) -> Path:
+        """Locate the .npz tensor file on disk for a given subject row.
+
+        Args:
+            row: Subject metadata row containing 'subject_id' and optional 'tensor_path'.
+
+        Returns:
+            Resolved absolute or relative path to the existing .npz tensor file.
+
+        Raises:
+            FileNotFoundError: If the tensor file cannot be located in any searched candidate directory.
+        """
+        sub_id = str(row["subject_id"])
+        tensor_path_str = str(row.get("tensor_path", ""))
+
+        candidates = []
+        if self.tensors_dir is not None:
+            if tensor_path_str:
+                candidates.append(self.tensors_dir / tensor_path_str)
+                candidates.append(self.tensors_dir / Path(tensor_path_str).name)
+            candidates.append(self.tensors_dir / f"{sub_id}.npz")
+            candidates.append(self.tensors_dir / "tensors" / f"{sub_id}.npz")
+
+        if tensor_path_str:
+            candidates.append(Path(tensor_path_str))
+            if self._manifest_dir is not None:
+                candidates.append(self._manifest_dir / tensor_path_str)
+
+        # Standard Kaggle and local paths
+        kaggle_base = Path("/kaggle/input/abide-i-nyu-multiview-fmri")
+        candidates.extend([
+            kaggle_base / "tensors" / f"{sub_id}.npz",
+            kaggle_base / tensor_path_str if tensor_path_str else kaggle_base / f"{sub_id}.npz",
+            Path("/kaggle/working/abide_nyu_multiview/tensors") / f"{sub_id}.npz",
+            Path("output/abide_nyu_multiview/tensors") / f"{sub_id}.npz",
+            Path("../output/abide_nyu_multiview/tensors") / f"{sub_id}.npz",
+        ])
+
+        for c in candidates:
+            if c and c.is_file():
+                return c
+
+        raise FileNotFoundError(
+            f"Could not locate tensor file for subject {sub_id}. "
+            f"Checked locations: {[str(c) for c in candidates[:4]]}"
+        )
+
+    def _load_raw_tensor(self, subject_idx: int) -> np.ndarray:
+        """Load the subject's raw multi-view volumetric tensor from archive or cache.
+
+        Args:
+            subject_idx: 0-based subject index within manifest_df.
+
+        Returns:
+            Multi-view tensor array of shape (1, 150, 224, 224).
+        """
+        row = self.manifest_df.iloc[subject_idx]
+        sub_id = str(row["subject_id"])
+        if self.cache_tensors and sub_id in self._tensor_cache:
+            return self._tensor_cache[sub_id]
+
+        file_path = self._resolve_tensor_file(row)
+        with np.load(file_path) as npz:
+            tensor_np = npz["tensor"]
+
+        if self.cache_tensors:
+            self._tensor_cache[sub_id] = tensor_np
+
+        return tensor_np
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract and return a patient bag of 2.5D tri-slices and its diagnostic label.
+
+        Args:
+            idx: 0-based index of the subject in the active split.
+
+        Returns:
+            Tuple of (bag_tensor, label_tensor):
+            - bag_tensor: Float tensor of shape (K, 3, H, W) containing 60 tri-slices
+              (20 axial, 20 coronal, 20 sagittal) where channels represent [z-1, z, z+1].
+            - label_tensor: Long tensor scalar with target diagnosis (1 = ASD, 0 = TC).
+        """
+        row = self.manifest_df.iloc[idx]
+        tensor_np = self._load_raw_tensor(idx)
+
+        bag = extract_tri_slices(
+            tensor_np,
+            slices_per_view=self.slices_per_view,
+            central_slices=self.central_slices,
+            stride=self.stride,
+        )
+
+        if self.transform is not None:
+            bag = self.transform(bag)
+            if not isinstance(bag, torch.Tensor):
+                bag = torch.as_tensor(bag, dtype=torch.float32)
+
+        label = int(row["dx_group"])
+        return bag, torch.tensor(label, dtype=torch.long)
+
+    def get_labels(self) -> np.ndarray:
+        """Return the 1D integer diagnosis labels for all subjects in the dataset.
+
+        Returns:
+            Numpy 1D array of length N with binary diagnostic targets (1 = ASD, 0 = TC).
+        """
+        return self.manifest_df["dx_group"].to_numpy(dtype=np.int64)
+
+

@@ -3,7 +3,7 @@
 from .svm import SVMClassifier
 from .cnn3d import Baseline3DCNN, SEBlock3D, SEResBlock3D, SEResNet3D
 from .focal_loss import FocalLoss
-from .augmentation import VolumeConsistentAugmenter
+from .augmentation import BagConsistentAugmenter, VolumeConsistentAugmenter
 
 __all__ = [
     "SVMClassifier",
@@ -13,4 +13,5 @@ __all__ = [
     "SEResNet3D",
     "FocalLoss",
     "VolumeConsistentAugmenter",
+    "BagConsistentAugmenter",
 ]

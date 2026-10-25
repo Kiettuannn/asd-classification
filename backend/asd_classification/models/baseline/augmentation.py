@@ -207,3 +207,180 @@ class VolumeConsistentAugmenter(nn.Module):
             raise ValueError(
                 f"Expected 3D, 4D, or 5D input tensor, but received tensor with shape {tensor_x.shape}"
             )
+
+
+class BagConsistentAugmenter(nn.Module):
+    """PyTorch module applying bag-consistent 2D data augmentation for 2.5D MIL.
+
+    Transforms include:
+    1. In-plane rotation within [-max_rotation_angle, +max_rotation_angle] degrees.
+    2. Random horizontal flip (reflection along Width axis) with probability p.
+    3. Random vertical flip (reflection along Height axis) with probability p.
+    4. Random intensity scaling factor in [scale_min, scale_max].
+
+    Transformation parameters are sampled once per subject bag and applied identically
+    across all instances (e.g. 60 tri-slices) during training. In evaluation mode
+    (training=False), the module acts as an identity pass-through.
+    """
+
+    def __init__(
+        self,
+        max_rotation_angle: float = 10.0,
+        p_flip_horizontal: float = 0.5,
+        p_flip_vertical: float = 0.5,
+        intensity_scale_range: Tuple[float, float] = (0.9, 1.1),
+    ) -> None:
+        """Initialize the bag-consistent augmenter.
+
+        Args:
+            max_rotation_angle: Maximum rotation deviation in degrees (+/- theta) (default: 10.0).
+            p_flip_horizontal: Probability of horizontal flip (default: 0.5).
+            p_flip_vertical: Probability of vertical flip (default: 0.5).
+            intensity_scale_range: Lower and upper bounds for intensity scaling (default: (0.9, 1.1)).
+        """
+        super().__init__()
+        self.max_rotation_angle = float(max_rotation_angle)
+        self.p_flip_horizontal = float(p_flip_horizontal)
+        self.p_flip_vertical = float(p_flip_vertical)
+        self.intensity_scale_range = (
+            float(intensity_scale_range[0]),
+            float(intensity_scale_range[1]),
+        )
+
+    def sample_parameters(self) -> Dict[str, Any]:
+        """Sample augmentation parameters once for a single patient bag.
+
+        Returns:
+            Dictionary containing rotation_angle, flip_horizontal, flip_vertical,
+            and intensity_scale parameters.
+        """
+        angle = random.uniform(-self.max_rotation_angle, self.max_rotation_angle)
+        flip_h = random.random() < self.p_flip_horizontal
+        flip_v = random.random() < self.p_flip_vertical
+        scale = random.uniform(self.intensity_scale_range[0], self.intensity_scale_range[1])
+
+        return {
+            "rotation_angle": angle,
+            "flip_horizontal": flip_h,
+            "flip_vertical": flip_v,
+            "intensity_scale": scale,
+        }
+
+    def _rotate_in_plane(self, bag: torch.Tensor, angle_degrees: float) -> torch.Tensor:
+        """Apply 2D in-plane rotation identically across all slices in the bag.
+
+        Args:
+            bag: 4D tensor of shape (K, C, H, W).
+            angle_degrees: Counter-clockwise rotation angle in degrees.
+
+        Returns:
+            Rotated 4D tensor of shape (K, C, H, W).
+        """
+        if abs(angle_degrees) < 1e-4:
+            return bag
+
+        k, c, h, w = bag.shape
+        rad = math.radians(angle_degrees)
+        cos_t = math.cos(rad)
+        sin_t = math.sin(rad)
+
+        theta = torch.tensor(
+            [[cos_t, -sin_t, 0.0], [sin_t, cos_t, 0.0]],
+            dtype=bag.dtype,
+            device=bag.device,
+        ).unsqueeze(0).repeat(k, 1, 1)
+
+        grid = F.affine_grid(theta, [k, c, h, w], align_corners=False)
+        rotated_bag = F.grid_sample(
+            bag,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        return rotated_bag
+
+    def _apply_to_bag(
+        self,
+        bag: torch.Tensor,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Apply sampled augmentation parameters consistently across a single patient bag.
+
+        Args:
+            bag: 4D tensor of shape (K, C, H, W).
+            params: Optional pre-sampled parameter dictionary for deterministic execution.
+
+        Returns:
+            Augmented 4D tensor of shape (K, C, H, W).
+        """
+        if params is None:
+            params = self.sample_parameters()
+
+        out = bag
+
+        # 1. In-plane horizontal reflection across all slices
+        if params.get("flip_horizontal", False):
+            out = torch.flip(out, dims=[-1])
+
+        # 2. In-plane vertical reflection across all slices
+        if params.get("flip_vertical", False):
+            out = torch.flip(out, dims=[-2])
+
+        # 3. In-plane rotation applied identically to all K slices
+        rotation_angle = params.get("rotation_angle", 0.0)
+        out = self._rotate_in_plane(out, rotation_angle)
+
+        # 4. Bag intensity scaling
+        intensity_scale = params.get("intensity_scale", 1.0)
+        if abs(intensity_scale - 1.0) > 1e-6:
+            out = out * intensity_scale
+
+        return out
+
+    def forward(
+        self,
+        x: Union[torch.Tensor, np.ndarray],
+        params: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Apply bag-consistent augmentation.
+
+        Unconditionally bypasses transformation and returns the exact input tensor
+        when in evaluation mode (training=False) to ensure strict evaluation invariance.
+
+        Args:
+            x: Input bag tensor with shape (K, C, H, W) or batched (B, K, C, H, W).
+            params: Optional dictionary specifying exact transformation parameters
+                (used during training mode for deterministic testing).
+
+        Returns:
+            Augmented PyTorch tensor preserving input shape.
+        """
+        # Strict evaluation invariance: always return input unchanged in evaluation mode
+        if not self.training:
+            if isinstance(x, torch.Tensor):
+                return x
+            return torch.as_tensor(x, dtype=torch.float32)
+
+        tensor_x = torch.as_tensor(x, dtype=torch.float32)
+
+        # Handle 4D unbatched single-bag: (K, C, H, W)
+        if tensor_x.ndim == 4:
+            return self._apply_to_bag(tensor_x, params=params)
+
+        # Handle 5D batched bags: (B, K, C, H, W)
+        elif tensor_x.ndim == 5:
+            b_dim = tensor_x.size(0)
+            augmented_bags = []
+            for b in range(b_dim):
+                batch_params = params if params is not None else self.sample_parameters()
+                aug_b = self._apply_to_bag(tensor_x[b], params=batch_params)
+                augmented_bags.append(aug_b)
+            return torch.stack(augmented_bags, dim=0)
+
+        else:
+            raise ValueError(
+                f"Expected 4D (K, C, H, W) or 5D (B, K, C, H, W) bag tensor, "
+                f"received shape {tuple(tensor_x.shape)}"
+            )
+

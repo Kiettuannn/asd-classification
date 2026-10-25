@@ -14,6 +14,7 @@ from asd_classification.preprocessing.multiview import (
     save_multiview_tensor,
     load_multiview_tensor,
     export_dataset_manifest,
+    extract_tri_slices,
 )
 from asd_classification.models.baseline.augmentation import VolumeConsistentAugmenter
 
@@ -31,5 +32,6 @@ __all__ = [
     "save_multiview_tensor",
     "load_multiview_tensor",
     "export_dataset_manifest",
+    "extract_tri_slices",
     "VolumeConsistentAugmenter",
 ]
