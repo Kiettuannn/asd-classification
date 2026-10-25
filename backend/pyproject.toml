@@ -26,6 +26,7 @@ api = [
 gnn = [
     "torch>=2.0.0",
     "torch-geometric>=2.3.0",
+    "torchvision>=0.15.0",
 ]
 dev = [
     "pytest>=8.0.0",
