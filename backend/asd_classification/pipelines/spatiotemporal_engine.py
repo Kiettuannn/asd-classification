@@ -11,7 +11,7 @@ Coordinates training and evaluation for the Spatio-Temporal 3D-CNN + Bidirection
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, cast, overload
 import math
 import numpy as np
 import pandas as pd
@@ -374,13 +374,41 @@ def train_spatiotemporal_epoch(
     return total_loss / max(total_samples, 1)
 
 
+@overload
 def evaluate_spatiotemporal_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
     use_bf16: bool = True,
+    return_attention: Literal[False] = False,
 ) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
+    ...
+
+
+@overload
+def evaluate_spatiotemporal_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    use_bf16: bool = True,
+    return_attention: Literal[True] = ...,
+) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ...
+
+
+def evaluate_spatiotemporal_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    use_bf16: bool = True,
+    return_attention: bool = False,
+) -> Union[
+    Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray],
+    Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]],
+]:
     """Execute validation or evaluation epoch calculating clinical diagnostic metrics.
 
     Args:
@@ -389,9 +417,13 @@ def evaluate_spatiotemporal_epoch(
         criterion: Loss criterion (e.g. FocalLoss).
         device: Target execution device.
         use_bf16: Enable native BF16 mixed precision autocasting (default: True).
+        return_attention: Whether to return extracted temporal attention weights (B, T) and masks.
 
     Returns:
-        Tuple of (average_loss, metrics_dictionary, y_true, y_pred, y_prob).
+        If return_attention is False:
+            Tuple of (average_loss, metrics_dictionary, y_true, y_pred, y_prob).
+        If return_attention is True:
+            Tuple of (average_loss, metrics_dictionary, y_true, y_pred, y_prob, y_attn, y_mask).
     """
     model.eval()
     total_loss = 0.0
@@ -399,6 +431,8 @@ def evaluate_spatiotemporal_epoch(
     all_targets: List[np.ndarray] = []
     all_preds: List[np.ndarray] = []
     all_probs: List[np.ndarray] = []
+    all_attns: List[np.ndarray] = []
+    all_masks: List[np.ndarray] = []
 
     device_type = "cuda" if device.type == "cuda" else "cpu"
 
@@ -425,7 +459,12 @@ def evaluate_spatiotemporal_epoch(
 
             with torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16):
                 outputs = model(volumes, mask=masks)
-                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                    attn = outputs[1] if len(outputs) > 1 else None
+                else:
+                    logits = outputs
+                    attn = None
 
             loss = criterion(logits.float(), targets)
 
@@ -438,16 +477,24 @@ def evaluate_spatiotemporal_epoch(
             all_targets.append(targets.cpu().numpy())
             all_preds.append(preds.cpu().numpy())
             all_probs.append(probs.cpu().numpy())
+            if attn is not None:
+                all_attns.append(attn.detach().cpu().float().numpy())
+            if masks is not None:
+                all_masks.append(masks.detach().cpu().bool().numpy())
 
     y_true = np.concatenate(all_targets) if all_targets else np.array([], dtype=int)
     y_pred = np.concatenate(all_preds) if all_preds else np.array([], dtype=int)
     y_prob = np.concatenate(all_probs) if all_probs else np.empty((0, 2), dtype=float)
+    y_attn = np.concatenate(all_attns, axis=0) if all_attns else np.empty((0, 0), dtype=float)
+    y_mask = np.concatenate(all_masks, axis=0) if all_masks else None
 
     avg_loss = total_loss / max(total_samples, 1)
     metrics = compute_classification_metrics(y_true, y_pred, y_prob=y_prob, loss_value=avg_loss)
     # Ensure Sensitivity is explicitly reported alongside recall per clinical convention
     metrics["sensitivity"] = metrics.get("recall", 0.0)
 
+    if return_attention:
+        return avg_loss, metrics, y_true, y_pred, y_prob, y_attn, y_mask
     return avg_loss, metrics, y_true, y_pred, y_prob
 
 
@@ -515,10 +562,12 @@ def run_spatiotemporal_kfold_cv(
         label_col=label_col,
     )
 
-    fold_metrics_list: List[Dict[str, float]] = []
+    fold_results_list: List[Dict[str, Any]] = []
     out_of_fold_preds: List[int] = []
     out_of_fold_targets: List[int] = []
     out_of_fold_probs: List[List[float]] = []
+    out_of_fold_attentions: List[np.ndarray] = []
+    out_of_fold_masks: List[np.ndarray] = []
 
     m_kwargs = model_kwargs or {}
 
@@ -612,18 +661,42 @@ def run_spatiotemporal_kfold_cv(
             core_model.load_state_dict(torch.load(fold_ckpt_path, map_location="cpu", weights_only=False))
             core_model.to(exec_device)
 
-        _, final_metrics, y_true_fold, y_pred_fold, y_prob_fold = evaluate_spatiotemporal_epoch(
+        eval_output = evaluate_spatiotemporal_epoch(
             model=parallel_model,
             dataloader=val_loader,
             criterion=criterion,
             device=exec_device,
             use_bf16=use_bf16,
+            return_attention=True,
         )
+        (
+            _,
+            final_metrics,
+            y_true_fold,
+            y_pred_fold,
+            y_prob_fold,
+            y_attn_fold,
+            y_mask_fold,
+        ) = eval_output  # type: ignore[misc]
 
-        fold_metrics_list.append(final_metrics)
+        fold_record: Dict[str, Any] = {
+            "fold": fold_idx,
+            **final_metrics,
+            "metrics": final_metrics,
+            "y_true": y_true_fold,
+            "y_pred": y_pred_fold,
+            "y_prob": y_prob_fold,
+            "y_attn": y_attn_fold,
+            "y_mask": y_mask_fold,
+        }
+        fold_results_list.append(fold_record)
         out_of_fold_targets.extend(y_true_fold.tolist())
         out_of_fold_preds.extend(y_pred_fold.tolist())
         out_of_fold_probs.extend(y_prob_fold.tolist())
+        if len(y_attn_fold) > 0:
+            out_of_fold_attentions.append(y_attn_fold)
+        if y_mask_fold is not None:
+            out_of_fold_masks.append(y_mask_fold)
 
     # Aggregate metric summary across all folds
     metric_keys = [
@@ -639,7 +712,7 @@ def run_spatiotemporal_kfold_cv(
     ]
     summary: Dict[str, Dict[str, float]] = {}
     for key in metric_keys:
-        vals = [f[key] for f in fold_metrics_list if key in f and not math.isnan(f[key])]
+        vals = [f[key] for f in fold_results_list if key in f and not math.isnan(f[key])]
         if vals:
             summary[key] = {
                 "mean": float(np.mean(vals)),
@@ -649,6 +722,8 @@ def run_spatiotemporal_kfold_cv(
     oof_targets_arr = np.array(out_of_fold_targets)
     oof_preds_arr = np.array(out_of_fold_preds)
     oof_probs_arr = np.array(out_of_fold_probs)
+    oof_attns_arr = np.concatenate(out_of_fold_attentions, axis=0) if out_of_fold_attentions else np.empty((0, 0))
+    oof_masks_arr = np.concatenate(out_of_fold_masks, axis=0) if out_of_fold_masks else None
     overall_oof_metrics = compute_classification_metrics(
         oof_targets_arr,
         oof_preds_arr,
@@ -656,10 +731,225 @@ def run_spatiotemporal_kfold_cv(
     )
 
     return {
-        "fold_results": fold_metrics_list,
+        "fold_results": fold_results_list,
         "summary": summary,
         "overall_oof_metrics": overall_oof_metrics,
         "oof_targets": oof_targets_arr,
         "oof_preds": oof_preds_arr,
         "oof_probs": oof_probs_arr,
+        "oof_attentions": oof_attns_arr,
+        "oof_masks": oof_masks_arr,
     }
+
+
+def plot_spatiotemporal_roc_curve(
+    y_true: Union[Sequence[int], np.ndarray],
+    y_prob: Union[Sequence[float], np.ndarray],
+    fold_evaluations: Optional[List[Dict[str, Any]]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    title: str = "Out-of-Fold Cross-Validation ROC Curve (3D-CNN + Bi-Mamba)",
+) -> Tuple[Any, Any]:
+    """Plot aggregate out-of-fold ROC curve with calculated AUC.
+
+    Args:
+        y_true: Array or sequence of binary true labels (0=TC, 1=ASD).
+        y_prob: Array or sequence of predicted probabilities for class 1 (ASD),
+            or 2D array of shape (N, 2).
+        fold_evaluations: Optional list of dictionaries with per-fold 'y_true' and 'y_prob'.
+        save_path: Optional output path to save the generated PNG plot.
+        title: Title for the ROC curve plot.
+
+    Returns:
+        Tuple of (matplotlib figure, matplotlib axes).
+
+    Raises:
+        ValueError: If y_true is empty or contains fewer than 2 distinct classes.
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_auc_score, roc_curve  # type: ignore[import-untyped]
+
+    y_true_arr = np.asarray(y_true).ravel()
+    y_prob_arr = np.asarray(y_prob)
+
+    if len(y_true_arr) == 0:
+        raise ValueError("y_true cannot be empty.")
+    if len(np.unique(y_true_arr)) < 2:
+        raise ValueError("y_true must contain at least 2 distinct classes to compute ROC curve.")
+
+    if y_prob_arr.ndim == 2 and y_prob_arr.shape[1] == 2:
+        y_score = y_prob_arr[:, 1]
+    else:
+        y_score = y_prob_arr.ravel()
+
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+
+    # Plot individual folds if available
+    if fold_evaluations:
+        for fold_idx, fold_eval in enumerate(fold_evaluations, 1):
+            if "y_true" in fold_eval and "y_prob" in fold_eval:
+                f_true = np.asarray(fold_eval["y_true"]).ravel()
+                f_prob = np.asarray(fold_eval["y_prob"])
+                f_score = f_prob[:, 1] if f_prob.ndim == 2 and f_prob.shape[1] == 2 else f_prob.ravel()
+                if len(np.unique(f_true)) > 1:
+                    f_fpr, f_tpr, _ = roc_curve(f_true, f_score)
+                    f_auc = roc_auc_score(f_true, f_score)
+                    ax.plot(f_fpr, f_tpr, linestyle="--", alpha=0.4, label=f"Fold {fold_idx} (AUC = {f_auc:.3f})")
+
+    # Aggregate ROC curve
+    fpr, tpr, _ = roc_curve(y_true_arr, y_score)
+    overall_auc = roc_auc_score(y_true_arr, y_score)
+    ax.plot(fpr, tpr, color="#1f77b4", lw=2.5, label=f"Aggregate Out-of-Fold (AUC = {overall_auc:.3f})")
+
+    # Chance level
+    ax.plot([0, 1], [0, 1], linestyle=":", color="gray", lw=1.5, label="Chance Level (AUC = 0.500)")
+
+    ax.set_xlim((0.0, 1.0))
+    ax.set_ylim((0.0, 1.05))
+    ax.set_xlabel("False Positive Rate (1 - Specificity)", fontsize=12)
+    ax.set_ylabel("True Positive Rate (Sensitivity)", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(loc="lower right", frameon=True, fontsize=10)
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+
+    return fig, ax
+
+
+def plot_temporal_attention_trajectories(
+    attention_weights: np.ndarray,
+    labels: Union[Sequence[int], np.ndarray],
+    masks: Optional[np.ndarray] = None,
+    tr_seconds: float = 2.0,
+    save_path: Optional[Union[str, Path]] = None,
+    title: str = "Mean Dynamic Temporal Attention Trajectories: ASD vs. TC Cohorts",
+) -> Tuple[Any, Any]:
+    """Plot mean temporal attention trajectories contrasting ASD vs. TC cohorts across scan time.
+
+    Extracts frame-by-frame attention weights alpha_t from Gated Temporal Attention Pooling,
+    computes cohort-level means with standard error bands (SEM), and highlights key temporal intervals
+    where hemodynamic attention discriminates between ASD and TC subjects.
+
+    Args:
+        attention_weights: Array of shape (N, T) containing temporal attention weights alpha_t.
+        labels: Array or sequence of binary ground-truth labels (0=TC, 1=ASD).
+        masks: Optional boolean array of shape (N, T) indicating valid unpadded frames.
+        tr_seconds: Scanner repetition time (TR) in seconds for time axis scaling (default: 2.0s).
+        save_path: Optional output path to save the generated PNG plot.
+        title: Title for the attention trajectory plot.
+
+    Returns:
+        Tuple of (matplotlib figure, matplotlib axes).
+
+    Raises:
+        ValueError: If attention_weights is not a 2D array or masks shape does not match.
+    """
+    import matplotlib.pyplot as plt
+
+    attentions = np.asarray(attention_weights, dtype=np.float32)
+    target_labels = np.asarray(labels).ravel()
+
+    if attentions.ndim != 2:
+        raise ValueError(f"Expected 2D array (N, T) for attention_weights, got shape {attentions.shape}")
+
+    if masks is not None and masks.shape != attentions.shape:
+        raise ValueError(f"masks shape {masks.shape} must match attention_weights shape {attentions.shape}")
+
+    _, seq_len = attentions.shape
+    time_points = np.arange(1, seq_len + 1)
+    time_seconds = time_points * tr_seconds
+
+    # Filter by diagnosis
+    asd_mask = (target_labels == 1)
+    tc_mask = (target_labels == 0)
+
+    # Compute masked statistics per time frame
+    def _compute_cohort_stats(cohort_bool_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        cohort_attns = attentions[cohort_bool_mask]
+        if len(cohort_attns) == 0:
+            return np.zeros(seq_len, dtype=np.float32), np.zeros(seq_len, dtype=np.float32)
+
+        if masks is not None:
+            cohort_valid = masks[cohort_bool_mask]
+            means_list: List[float] = []
+            sems_list: List[float] = []
+            for t in range(seq_len):
+                valid_vals = cohort_attns[cohort_valid[:, t], t]
+                if len(valid_vals) > 0:
+                    mean_val = float(np.mean(valid_vals))
+                    sem_val = float(np.std(valid_vals) / np.sqrt(len(valid_vals))) if len(valid_vals) > 1 else 0.0
+                else:
+                    mean_val, sem_val = 0.0, 0.0
+                means_list.append(mean_val)
+                sems_list.append(sem_val)
+            return np.array(means_list, dtype=np.float32), np.array(sems_list, dtype=np.float32)
+
+        mean_vals = np.mean(cohort_attns, axis=0)
+        n_sub = len(cohort_attns)
+        sem_vals = np.std(cohort_attns, axis=0) / np.sqrt(n_sub) if n_sub > 1 else np.zeros(seq_len, dtype=np.float32)
+        return np.asarray(mean_vals, dtype=np.float32), np.asarray(sem_vals, dtype=np.float32)
+
+    asd_mean, asd_sem = _compute_cohort_stats(asd_mask)
+    tc_mean, tc_sem = _compute_cohort_stats(tc_mask)
+    divergence = np.abs(asd_mean - tc_mean)
+
+    fig, (ax_main, ax_diff) = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=(12, 8),
+        dpi=150,
+        gridspec_kw={"height_ratios": [2.5, 1]},
+        sharex=True,
+    )
+
+    # Top plot: ASD vs TC mean attention trajectories
+    n_asd = int(np.sum(asd_mask))
+    n_tc = int(np.sum(tc_mask))
+
+    ax_main.plot(time_seconds, asd_mean, color="#d62728", lw=2.0, label=f"ASD Cohort (N={n_asd})")
+    ax_main.fill_between(time_seconds, asd_mean - asd_sem, asd_mean + asd_sem, color="#d62728", alpha=0.2)
+
+    ax_main.plot(time_seconds, tc_mean, color="#1f77b4", lw=2.0, label=f"TC Cohort (N={n_tc})")
+    ax_main.fill_between(time_seconds, tc_mean - tc_sem, tc_mean + tc_sem, color="#1f77b4", alpha=0.2)
+
+    ax_main.set_ylabel("Temporal Attention Weight (alpha_t)", fontsize=11)
+    ax_main.set_title(title, fontsize=13, fontweight="bold")
+    ax_main.legend(loc="upper right", frameon=True, fontsize=10)
+    ax_main.grid(True, linestyle="--", alpha=0.5)
+
+    # Bottom plot: Temporal Attention Divergence |ASD - TC|
+    ax_diff.plot(time_seconds, divergence, color="#2ca02c", lw=1.8, label="|ASD - TC| Attention Differential")
+    ax_diff.fill_between(time_seconds, 0, divergence, color="#2ca02c", alpha=0.2)
+
+    # Annotate peak divergence
+    if len(divergence) > 0 and np.max(divergence) > 0:
+        peak_idx = int(np.argmax(divergence))
+        peak_t = time_seconds[peak_idx]
+        peak_val = divergence[peak_idx]
+        ax_diff.annotate(
+            f"Peak Divergence (t={peak_t:.0f}s, frame={peak_idx+1})",
+            xy=(peak_t, peak_val),
+            xytext=(peak_t + 10, peak_val * 0.9 + 1e-4),
+            arrowprops=dict(facecolor="black", shrink=0.05, width=1, headwidth=6),
+            fontsize=9,
+        )
+
+    ax_diff.set_xlabel("Scan Acquisition Time (Seconds, TR=2.0s)", fontsize=11)
+    ax_diff.set_ylabel("Attention Divergence", fontsize=10)
+    ax_diff.legend(loc="upper right", frameon=True, fontsize=9)
+    ax_diff.grid(True, linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+
+    return fig, (ax_main, ax_diff)
+

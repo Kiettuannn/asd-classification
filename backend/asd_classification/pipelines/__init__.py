@@ -17,6 +17,8 @@ from .spatiotemporal_engine import (
     configure_cosine_scheduler,
     configure_spatiotemporal_optimizer,
     evaluate_spatiotemporal_epoch,
+    plot_spatiotemporal_roc_curve,
+    plot_temporal_attention_trajectories,
     resolve_device_and_dtype,
     run_spatiotemporal_kfold_cv,
     setup_model_parallelism,

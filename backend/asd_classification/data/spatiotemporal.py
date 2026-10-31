@@ -41,6 +41,7 @@ def discover_multisite_dataset(
 
     Raises:
         FileNotFoundError: If no phenotypic CSV or functional NIfTI files are found.
+        ValueError: If phenotypic CSV format is invalid or missing required columns.
     """
     if candidate_paths is None:
         search_roots = [
@@ -67,98 +68,155 @@ def discover_multisite_dataset(
             f"None of the candidate paths exist: {[str(p) for p in search_roots]}"
         )
 
-    # Locate phenotypic cohort summary table across candidate locations
-    phenotypic_csv: Optional[Path] = None
+    # Locate phenotypic cohort summary tables across candidate locations
+    discovered_csvs: List[Path] = []
     for root in existing_roots:
         if root.is_file() and root.suffix == ".csv":
-            phenotypic_csv = root
-            break
+            discovered_csvs.append(root)
+            continue
         pattern = "**/*.csv" if recursive else "*.csv"
         csv_candidates = list(root.glob(pattern))
         for candidate in csv_candidates:
             lower_name = candidate.name.lower()
             if "phenotypic" in lower_name or "metadata" in lower_name:
-                phenotypic_csv = candidate
-                break
-        if phenotypic_csv is not None:
-            break
+                discovered_csvs.append(candidate)
 
-    if phenotypic_csv is None:
+    # Deduplicate resolved CSV paths
+    unique_csvs: List[Path] = []
+    seen_csv_paths = set()
+    for c in discovered_csvs:
+        res = c.resolve()
+        if res not in seen_csv_paths:
+            seen_csv_paths.add(res)
+            unique_csvs.append(c)
+
+    if not unique_csvs:
         raise FileNotFoundError(
             "Could not locate phenotypic CSV (e.g., 'Phenotypic_V1_0b_preprocessed1.csv' or 'metadata.csv') "
             f"across candidate paths: {[str(p) for p in existing_roots]}"
         )
 
-    # Collect functional NIfTI acquisitions (*func_preproc.nii.gz or *func_preproc.nii)
+    # Collect functional NIfTI acquisitions (*func_preproc.nii.gz, *.nii.gz, *.nii)
     nifti_files_set = set()
     for root in existing_roots:
-        pattern = "**/*func_preproc.nii*" if recursive else "*func_preproc.nii*"
-        for nifti_path in root.glob(pattern):
-            nifti_files_set.add(nifti_path.resolve())
+        patterns = ["**/*func_preproc.nii*", "**/*.nii.gz", "**/*.nii"] if recursive else ["*func_preproc.nii*", "*.nii.gz", "*.nii"]
+        for pattern in patterns:
+            for nifti_path in root.glob(pattern):
+                nifti_files_set.add(nifti_path.resolve())
 
     nifti_files: List[Path] = sorted(list(nifti_files_set))
-    if not nifti_files:
-        raise FileNotFoundError(
-            "Could not locate functional NIfTI files matching '*func_preproc.nii*' "
-            f"across candidate paths: {[str(p) for p in existing_roots]}"
-        )
 
-    # Standardize phenotypic manifest and map ABIDE diagnostic codes to binary 0/1 labels
-    raw_df = pd.read_csv(phenotypic_csv)
-    df = raw_df.copy()
+    # Standardize phenotypic manifests from all discovered CSVs (supports multi-part datasets)
+    dfs: List[pd.DataFrame] = []
+    for csv_path in unique_csvs:
+        try:
+            raw_df = pd.read_csv(csv_path)
+        except Exception:
+            continue
 
-    col_map = {col: col.upper() for col in df.columns}
-    rev_col_map = {v: k for k, v in col_map.items()}
+        if raw_df.empty:
+            continue
 
-    sub_col = rev_col_map.get("SUB_ID") or rev_col_map.get("SUBJECT_ID")
-    if sub_col is None:
-        raise ValueError("Phenotypic CSV must contain a 'SUB_ID' or 'subject_id' column.")
-    df["subject_id"] = df[sub_col].astype(str).str.strip()
+        df_part = raw_df.copy()
+        col_map = {col: col.upper() for col in df_part.columns}
+        rev_col_map = {v: k for k, v in col_map.items()}
 
-    # Map ABIDE DX_GROUP (1 = Autism/ASD, 2 = Control/TC) into binary classification targets (ASD=1, TC=0)
-    dx_col = rev_col_map.get("DX_GROUP") or rev_col_map.get("DX") or rev_col_map.get("LABEL")
-    if dx_col is not None:
-        unique_vals = set(df[dx_col].dropna().unique())
-        if {1, 2}.issubset(unique_vals) or 2 in unique_vals:
-            df["label"] = (df[dx_col] == 1).astype(int)
+        sub_col = rev_col_map.get("SUB_ID") or rev_col_map.get("SUBJECT_ID")
+        if sub_col is None:
+            continue
+        df_part["subject_id"] = df_part[sub_col].astype(str).str.strip()
+
+        # Map ABIDE DX_GROUP (1 = Autism/ASD, 2 = Control/TC) into binary classification targets (ASD=1, TC=0)
+        dx_col = rev_col_map.get("DX_GROUP") or rev_col_map.get("DX") or rev_col_map.get("LABEL")
+        if dx_col is not None:
+            unique_vals = set(df_part[dx_col].dropna().unique())
+            if {1, 2}.issubset(unique_vals) or 2 in unique_vals:
+                df_part["label"] = (df_part[dx_col] == 1).astype(int)
+            else:
+                df_part["label"] = df_part[dx_col].astype(int)
         else:
-            df["label"] = df[dx_col].astype(int)
-    else:
-        raise ValueError("Phenotypic CSV must contain a diagnostic label column ('DX_GROUP' or 'label').")
+            continue
 
-    site_col = rev_col_map.get("SITE_ID") or rev_col_map.get("SITE")
-    df["site_id"] = df[site_col].astype(str).str.strip() if site_col else "UNKNOWN"
+        site_col = rev_col_map.get("SITE_ID") or rev_col_map.get("SITE")
+        df_part["site_id"] = df_part[site_col].astype(str).str.strip() if site_col else "UNKNOWN"
 
-    file_id_col = rev_col_map.get("FILE_ID")
-    if file_id_col:
-        df["file_id"] = df[file_id_col].astype(str).str.strip()
-    else:
-        df["file_id"] = "no_filename"
+        file_id_col = rev_col_map.get("FILE_ID")
+        if file_id_col:
+            df_part["file_id"] = df_part[file_id_col].astype(str).str.strip()
+        else:
+            df_part["file_id"] = "no_filename"
 
-    # Match each phenotypic subject to its corresponding functional NIfTI file
-    # Handles both standardized FILE_ID strings and delimiter variations (underscores, zero-padding)
+        # Check if CSV directly provides file_path
+        fp_col = rev_col_map.get("FILE_PATH")
+        if fp_col:
+            resolved_paths: List[Optional[Path]] = []
+            for _, r in df_part.iterrows():
+                val = str(r[fp_col]).strip() if pd.notna(r[fp_col]) else ""
+                candidate_target: Optional[Path] = None
+                if val:
+                    p_val = Path(val)
+                    if p_val.is_absolute() and p_val.exists():
+                        candidate_target = p_val
+                    elif (csv_path.parent / p_val).exists():
+                        candidate_target = (csv_path.parent / p_val).resolve()
+                    elif (csv_path.parent / "scans" / p_val.name).exists():
+                        candidate_target = (csv_path.parent / "scans" / p_val.name).resolve()
+                    elif (csv_path.parent.parent / "scans" / p_val.name).exists():
+                        candidate_target = (csv_path.parent.parent / "scans" / p_val.name).resolve()
+                resolved_paths.append(candidate_target)
+            df_part["file_path"] = pd.Series(resolved_paths, dtype=object)
+        else:
+            df_part["file_path"] = pd.Series([None] * len(df_part), dtype=object)
+
+        dfs.append(df_part)
+
+    if not dfs:
+        raise ValueError("Could not extract valid subject records with IDs and labels from candidate CSVs.")
+
+    df = pd.concat(dfs, ignore_index=True)
+    df.drop_duplicates(subset=["subject_id"], keep="first", inplace=True)
+
+    # Match each phenotypic subject without a resolved file_path to functional NIfTI files
     file_map: Dict[str, Path] = {}
+    for _, row in df.iterrows():
+        sid = row["subject_id"]
+        if row.get("file_path") is not None and pd.notna(row["file_path"]):
+            file_map[sid] = Path(row["file_path"])
 
-    for nifti in nifti_files:
-        name = nifti.name
-        for _, row in df.iterrows():
-            sub_id = row["subject_id"]
-            file_id = row["file_id"]
+    if nifti_files:
+        unmatched_subs = {
+            str(row["subject_id"]): str(row["file_id"])
+            for _, row in df.iterrows()
+            if str(row["subject_id"]) not in file_map
+        }
+        for nifti in nifti_files:
+            name = nifti.name
+            matched_sid: Optional[str] = None
+            for sub_id, file_id in unmatched_subs.items():
+                matched = False
+                if file_id != "no_filename" and file_id in name:
+                    matched = True
+                elif f"00{sub_id}" in name or f"_{sub_id}_" in name or name.startswith(f"{sub_id}_"):
+                    matched = True
+                elif re.search(rf"(?:^|[^0-9])0*{re.escape(sub_id)}(?:[^0-9]|$)", name):
+                    matched = True
 
-            matched = False
-            if file_id != "no_filename" and file_id in name:
-                matched = True
-            elif f"00{sub_id}" in name or f"_{sub_id}_" in name or name.startswith(f"{sub_id}_"):
-                matched = True
-            elif re.search(rf"(?:^|[^0-9])0*{re.escape(sub_id)}(?:[^0-9]|$)", name):
-                matched = True
+                if matched:
+                    matched_sid = sub_id
+                    break
 
-            if matched:
-                file_map[sub_id] = nifti
-                break
+            if matched_sid is not None:
+                file_map[matched_sid] = nifti.resolve()
+                del unmatched_subs[matched_sid]
 
     df["file_path"] = df["subject_id"].map(lambda sid: file_map.get(sid))
     matched_df = df[df["file_path"].notna()].copy()
+    if matched_df.empty:
+        raise FileNotFoundError(
+            "Could not locate matching functional NIfTI files for subjects in manifest "
+            f"across candidate paths: {[str(p) for p in existing_roots]}"
+        )
+
     matched_df["file_path"] = matched_df["file_path"].map(lambda p: Path(p))
     matched_df.reset_index(drop=True, inplace=True)
 

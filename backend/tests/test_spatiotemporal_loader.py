@@ -97,6 +97,52 @@ def test_discover_multisite_dataset_not_found(tmp_path: Path):
         discover_multisite_dataset(candidate_paths=[empty_dir])
 
 
+def test_discover_multisite_dataset_multipart_kaggle(tmp_path: Path):
+    """Verify that discover_multisite_dataset aggregates subjects across multiple Kaggle dataset parts."""
+    input_dir = tmp_path / "kaggle_input"
+
+    # Part 1: NYU mounted dataset
+    p1_dir = input_dir / "abide-i-p1"
+    p1_scans = p1_dir / "scans"
+    p1_scans.mkdir(parents=True)
+    f1 = p1_scans / "NYU_0050952_func_preproc.nii.gz"
+    f1.write_text("dummy_nii")
+    df1 = pd.DataFrame([
+        {
+            "subject_id": "50952",
+            "site_id": "NYU",
+            "dx_group": 1,
+            "file_path": "scans/NYU_0050952_func_preproc.nii.gz",
+        }
+    ])
+    df1.to_csv(p1_dir / "metadata.csv", index=False)
+
+    # Part 3: Nested abide_i_raw_part3 (CALTECH)
+    p3_dir = input_dir / "abide-i-p3" / "abide_i_raw_part3"
+    p3_scans = p3_dir / "scans"
+    p3_scans.mkdir(parents=True)
+    f3 = p3_scans / "Caltech_0051456_func_preproc.nii.gz"
+    f3.write_text("dummy_nii")
+    df3 = pd.DataFrame([
+        {
+            "subject_id": "51456",
+            "site_id": "CALTECH",
+            "dx_group": 2,
+            "file_path": "scans/Caltech_0051456_func_preproc.nii.gz",
+        }
+    ])
+    df3.to_csv(p3_dir / "metadata.csv", index=False)
+
+    manifest_df, file_mapping = discover_multisite_dataset(candidate_paths=[input_dir])
+
+    assert len(manifest_df) == 2
+    assert set(manifest_df["subject_id"].tolist()) == {"50952", "51456"}
+    assert file_mapping["50952"].resolve() == f1.resolve()
+    assert file_mapping["51456"].resolve() == f3.resolve()
+    assert int(manifest_df[manifest_df["subject_id"] == "50952"]["label"].iloc[0]) == 1
+    assert int(manifest_df[manifest_df["subject_id"] == "51456"]["label"].iloc[0]) == 0
+
+
 def test_trim_temporal_frames():
     """Verify that trim_temporal_frames removes first 10 and last 10 TR frames.
 
