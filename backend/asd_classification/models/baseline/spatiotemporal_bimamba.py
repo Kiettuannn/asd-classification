@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as cuda_selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as cuda_selective_scan_fn  # type: ignore[import-not-found]
     HAS_CUDA_MAMBA = True
 except (ImportError, Exception):
     HAS_CUDA_MAMBA = False
@@ -44,6 +44,8 @@ class Spatial3DCNNEncoder(nn.Module):
         out_features: int = 128,
         leaky_relu_slope: float = 0.01,
         dropout: float = 0.1,
+        spatial_chunk_size: int = 16,
+        use_checkpoint: bool = True,
     ) -> None:
         """Initialize the 4-block 3D-CNN spatial encoder.
 
@@ -52,10 +54,14 @@ class Spatial3DCNNEncoder(nn.Module):
             out_features: Dimensionality of output spatial embedding vector (default: 128).
             leaky_relu_slope: Negative slope for LeakyReLU activations (default: 0.01).
             dropout: Dropout probability before output projection (default: 0.1).
+            spatial_chunk_size: Micro-batch size for processing 3D volumes to bound peak activation memory (default: 16).
+            use_checkpoint: Whether to apply gradient checkpointing over spatial chunks during training (default: True).
         """
         super().__init__()
         self.in_channels = in_channels
         self.out_features = out_features
+        self.spatial_chunk_size = spatial_chunk_size
+        self.use_checkpoint = use_checkpoint
 
         # 4 volumetric convolutional stages (channels 32 -> 64 -> 128 -> 256)
         self.block1 = self._make_block(in_channels, 32, leaky_relu_slope)
@@ -84,6 +90,16 @@ class Spatial3DCNNEncoder(nn.Module):
             nn.LeakyReLU(negative_slope=slope, inplace=True),
             nn.MaxPool3d(kernel_size=2, stride=2),
         )
+
+    def _forward_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
+        """Process a micro-batch of 3D volumes through the 4-stage convolutional backbone."""
+        h1 = self.block1(chunk)
+        h2 = self.block2(h1)
+        h3 = self.block3(h2)
+        h4 = self.block4(h3)
+        pooled = self.global_pool(h4).flatten(1)
+        dropped = self.dropout(pooled)
+        return self.fc(dropped)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Extract spatial embeddings from 5D or 6D neuroimaging volume inputs.
@@ -115,16 +131,21 @@ class Spatial3DCNNEncoder(nn.Module):
                 f"got shape {tuple(x.shape)}"
             )
 
-        # Pass through 4 convolutional stages
-        h1 = self.block1(x_flat)
-        h2 = self.block2(h1)
-        h3 = self.block3(h2)
-        h4 = self.block4(h3)
-
-        # Pool spatially to (N_total, 256, 1, 1, 1) and flatten
-        pooled = self.global_pool(h4).flatten(1)
-        dropped = self.dropout(pooled)
-        out = self.fc(dropped)
+        # Micro-batch chunking to bound peak activation allocations and eliminate CUDA OOM
+        chunk_size = self.spatial_chunk_size
+        if is_sequence and chunk_size > 0 and x_flat.size(0) > chunk_size:
+            out_chunks = []
+            for chunk in torch.split(x_flat, chunk_size, dim=0):
+                if self.training and self.use_checkpoint:
+                    chunk_out = torch.utils.checkpoint.checkpoint(
+                        self._forward_chunk, chunk, use_reentrant=False
+                    )
+                else:
+                    chunk_out = self._forward_chunk(chunk)
+                out_chunks.append(chunk_out)
+            out = torch.cat(out_chunks, dim=0)
+        else:
+            out = self._forward_chunk(x_flat)
 
         if is_sequence:
             return out.reshape(batch_size, time_steps, self.out_features)
@@ -664,6 +685,8 @@ class SpatioTemporalBiMamba(nn.Module):
         attention_dropout: float = 0.0,
         head_dropout: float = 0.4,
         force_pure_pytorch: bool = False,
+        spatial_chunk_size: int = 16,
+        use_checkpoint: bool = True,
     ) -> None:
         """Initialize the Spatio-Temporal 3D-CNN + Bi-Mamba model.
 
@@ -680,17 +703,21 @@ class SpatioTemporalBiMamba(nn.Module):
             attention_dropout: Dropout probability in temporal attention pooling (default: 0.0).
             head_dropout: Dropout probability in classification head (default: 0.4).
             force_pure_pytorch: Force pure PyTorch fallback for selective scan.
+            spatial_chunk_size: Micro-batch size for processing 3D volumes (default: 16).
+            use_checkpoint: Apply gradient checkpointing over spatial chunks during training (default: True).
         """
         super().__init__()
         self.in_channels = in_channels
         self.d_model = d_model
         self.num_classes = num_classes
 
-        # Component 1: Volumetric 3D-CNN spatial encoder
+        # Component 1: Volumetric 3D-CNN spatial encoder with chunking and checkpointing
         self.spatial_encoder = Spatial3DCNNEncoder(
             in_channels=in_channels,
             out_features=d_model,
             dropout=spatial_dropout,
+            spatial_chunk_size=spatial_chunk_size,
+            use_checkpoint=use_checkpoint,
         )
 
         # Component 2: 2-layer Bidirectional Mamba sequence model
