@@ -1110,4 +1110,25 @@ def run_training_pipeline(
             **kwargs,
         )
 
+    if model_type.lower() in (
+        "spatiotemporal",
+        "spatiotemporal_bimamba",
+        "bimamba",
+        "3dcnn_bimamba",
+    ):
+        from asd_classification.pipelines.spatiotemporal_engine import run_spatiotemporal_kfold_cv
+
+        manifest = kwargs.pop("manifest", None)
+        if manifest is None and "manifest_path" in kwargs:
+            manifest = pd.read_csv(kwargs.pop("manifest_path"))
+        dataset = kwargs.pop("dataset", None)
+        if dataset is None:
+            dataset = kwargs.pop("dataset_or_paths", None)
+
+        return run_spatiotemporal_kfold_cv(
+            manifest=manifest,
+            dataset_or_paths=dataset,
+            **kwargs,
+        )
+
     raise NotImplementedError(f"Training pipeline for '{model_type}' is not yet implemented.")

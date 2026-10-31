@@ -11,6 +11,18 @@ from .evaluate import (
     plot_roc_curve,
     run_evaluation_pipeline,
 )
+from .spatiotemporal_engine import (
+    SpatiotemporalEarlyStopping,
+    compute_fold_class_weights,
+    configure_cosine_scheduler,
+    configure_spatiotemporal_optimizer,
+    evaluate_spatiotemporal_epoch,
+    resolve_device_and_dtype,
+    run_spatiotemporal_kfold_cv,
+    setup_model_parallelism,
+    train_spatiotemporal_epoch,
+    unwrap_model,
+)
 from .train import (
     EarlyStopping,
     compute_differential_cosine_warmup_lr,
@@ -46,4 +58,14 @@ __all__ = [
     "compute_differential_cosine_warmup_lr",
     "update_learning_rates",
     "run_stratified_kfold_cv",
+    "resolve_device_and_dtype",
+    "unwrap_model",
+    "setup_model_parallelism",
+    "compute_fold_class_weights",
+    "configure_spatiotemporal_optimizer",
+    "configure_cosine_scheduler",
+    "SpatiotemporalEarlyStopping",
+    "train_spatiotemporal_epoch",
+    "evaluate_spatiotemporal_epoch",
+    "run_spatiotemporal_kfold_cv",
 ]
