@@ -68,7 +68,20 @@ def discover_multisite_dataset(
             f"None of the candidate paths exist: {[str(p) for p in search_roots]}"
         )
 
-    # Locate phenotypic cohort summary tables across candidate locations
+    # 1. Discover all candidate preprocessed .pt files (excluding checkpoints)
+    pt_files_dict: Dict[str, Path] = {}
+    for root in existing_roots:
+        pattern = "**/*.pt" if recursive else "*.pt"
+        for pt_path in root.glob(pattern):
+            name = pt_path.name
+            if not name.startswith("best_") and not name.startswith("checkpoint_") and not name.startswith("model_"):
+                sub_key = pt_path.stem
+                if sub_key.startswith("sub-"):
+                    sub_key = sub_key[4:]
+                if sub_key not in pt_files_dict:
+                    pt_files_dict[sub_key] = pt_path.resolve()
+
+    # 2. Locate phenotypic summary tables or preprocessed manifests across candidate locations
     discovered_csvs: List[Path] = []
     for root in existing_roots:
         if root.is_file() and root.suffix == ".csv":
@@ -78,7 +91,7 @@ def discover_multisite_dataset(
         csv_candidates = list(root.glob(pattern))
         for candidate in csv_candidates:
             lower_name = candidate.name.lower()
-            if "phenotypic" in lower_name or "metadata" in lower_name:
+            if any(k in lower_name for k in ["phenotypic", "metadata", "manifest", "preprocessed"]):
                 discovered_csvs.append(candidate)
 
     # Deduplicate resolved CSV paths
@@ -90,13 +103,13 @@ def discover_multisite_dataset(
             seen_csv_paths.add(res)
             unique_csvs.append(c)
 
-    if not unique_csvs:
+    if not unique_csvs and not pt_files_dict:
         raise FileNotFoundError(
-            "Could not locate phenotypic CSV (e.g., 'Phenotypic_V1_0b_preprocessed1.csv' or 'metadata.csv') "
-            f"across candidate paths: {[str(p) for p in existing_roots]}"
+            "Could not locate phenotypic CSV or preprocessed .pt files across candidate paths: "
+            f"{[str(p) for p in existing_roots]}"
         )
 
-    # Collect functional NIfTI acquisitions (*func_preproc.nii.gz, *.nii.gz, *.nii)
+    # 3. Collect functional NIfTI acquisitions (*func_preproc.nii.gz, *.nii.gz, *.nii)
     nifti_files_set = set()
     for root in existing_roots:
         patterns = ["**/*func_preproc.nii*", "**/*.nii.gz", "**/*.nii"] if recursive else ["*func_preproc.nii*", "*.nii.gz", "*.nii"]
@@ -106,7 +119,7 @@ def discover_multisite_dataset(
 
     nifti_files: List[Path] = sorted(list(nifti_files_set))
 
-    # Standardize phenotypic manifests from all discovered CSVs (supports multi-part datasets)
+    # Standardize manifests from all discovered CSVs (supports multi-part datasets)
     dfs: List[pd.DataFrame] = []
     for csv_path in unique_csvs:
         try:
@@ -146,13 +159,31 @@ def discover_multisite_dataset(
         else:
             df_part["file_id"] = "no_filename"
 
-        # Check if CSV directly provides file_path
+        # Check for preprocessed pt_file column or generic file_path
+        pt_col = rev_col_map.get("PT_FILE")
         fp_col = rev_col_map.get("FILE_PATH")
-        if fp_col:
-            resolved_paths: List[Optional[Path]] = []
-            for _, r in df_part.iterrows():
-                val = str(r[fp_col]).strip() if pd.notna(r[fp_col]) else ""
-                candidate_target: Optional[Path] = None
+
+        resolved_paths: List[Optional[Path]] = []
+        for _, r in df_part.iterrows():
+            sid = str(r["subject_id"])
+            candidate_target: Optional[Path] = None
+
+            # Prioritize matching against discovered .pt files
+            if sid in pt_files_dict:
+                candidate_target = pt_files_dict[sid]
+            elif sid.isdigit() and str(int(sid)) in pt_files_dict:
+                candidate_target = pt_files_dict[str(int(sid))]
+            elif pt_col and pd.notna(r[pt_col]):
+                pt_val = Path(str(r[pt_col]).strip())
+                cand = csv_path.parent / "scans" / pt_val.name
+                if cand.exists():
+                    candidate_target = cand.resolve()
+                elif (csv_path.parent / pt_val.name).exists():
+                    candidate_target = (csv_path.parent / pt_val.name).resolve()
+
+            # Fallback to generic file_path if provided
+            if candidate_target is None and fp_col and pd.notna(r[fp_col]):
+                val = str(r[fp_col]).strip()
                 if val:
                     p_val = Path(val)
                     if p_val.is_absolute() and p_val.exists():
@@ -163,25 +194,49 @@ def discover_multisite_dataset(
                         candidate_target = (csv_path.parent / "scans" / p_val.name).resolve()
                     elif (csv_path.parent.parent / "scans" / p_val.name).exists():
                         candidate_target = (csv_path.parent.parent / "scans" / p_val.name).resolve()
-                resolved_paths.append(candidate_target)
-            df_part["file_path"] = pd.Series(resolved_paths, dtype=object)
-        else:
-            df_part["file_path"] = pd.Series([None] * len(df_part), dtype=object)
 
+            resolved_paths.append(candidate_target)
+
+        df_part["file_path"] = pd.Series(resolved_paths, dtype=object)
         dfs.append(df_part)
 
+    # If no valid CSV manifest records but preprocessed .pt files exist, reconstruct manifest directly from .pt payloads
+    if not dfs and pt_files_dict:
+        records = []
+        for sid, pt_path in sorted(pt_files_dict.items()):
+            try:
+                payload = torch.load(pt_path, map_location="cpu", weights_only=True)
+                records.append({
+                    "subject_id": str(payload.get("subject_id", sid)),
+                    "site_id": str(payload.get("site_id", "UNKNOWN")),
+                    "label": int(payload.get("label", 0)),
+                    "file_id": "preprocessed_pt",
+                    "file_path": pt_path,
+                })
+            except Exception:
+                continue
+        if records:
+            dfs.append(pd.DataFrame(records))
+
     if not dfs:
-        raise ValueError("Could not extract valid subject records with IDs and labels from candidate CSVs.")
+        raise ValueError(
+            "Could not extract valid subject records from candidate CSVs or .pt archives: "
+            f"{[str(p) for p in existing_roots]}"
+        )
 
     df = pd.concat(dfs, ignore_index=True)
     df.drop_duplicates(subset=["subject_id"], keep="first", inplace=True)
 
-    # Match each phenotypic subject without a resolved file_path to functional NIfTI files
+    # Match each subject without a resolved file_path against preprocessed .pt or NIfTI files
     file_map: Dict[str, Path] = {}
     for _, row in df.iterrows():
-        sid = row["subject_id"]
+        sid = str(row["subject_id"])
         if row.get("file_path") is not None and pd.notna(row["file_path"]):
             file_map[sid] = Path(row["file_path"])
+        elif sid in pt_files_dict:
+            file_map[sid] = pt_files_dict[sid]
+        elif sid.isdigit() and str(int(sid)) in pt_files_dict:
+            file_map[sid] = pt_files_dict[str(int(sid))]
 
     if nifti_files:
         unmatched_subs = {
@@ -209,18 +264,18 @@ def discover_multisite_dataset(
                 file_map[matched_sid] = nifti.resolve()
                 del unmatched_subs[matched_sid]
 
-    df["file_path"] = df["subject_id"].map(lambda sid: file_map.get(sid))
+    df["file_path"] = df["subject_id"].map(lambda sid: file_map.get(str(sid)))
     matched_df = df[df["file_path"].notna()].copy()
     if matched_df.empty:
         raise FileNotFoundError(
-            "Could not locate matching functional NIfTI files for subjects in manifest "
+            "Could not locate matching functional NIfTI or preprocessed .pt files for subjects in manifest "
             f"across candidate paths: {[str(p) for p in existing_roots]}"
         )
 
     matched_df["file_path"] = matched_df["file_path"].map(lambda p: Path(p))
     matched_df.reset_index(drop=True, inplace=True)
 
-    return matched_df, {row["subject_id"]: Path(row["file_path"]) for _, row in matched_df.iterrows()}
+    return matched_df, {str(row["subject_id"]): Path(row["file_path"]) for _, row in matched_df.iterrows()}
 
 
 
