@@ -646,7 +646,21 @@ class SpatioTemporalFMRIDataset(Dataset):
         file_path = Path(row["file_path"])
 
         if not file_path.exists():
-            raise FileNotFoundError(f"fMRI NIfTI file not found: {file_path}")
+            raise FileNotFoundError(f"fMRI file not found: {file_path}")
+
+        # Direct loading for preprocessed PyTorch tensor artifacts (.pt)
+        if file_path.suffix == ".pt":
+            payload = torch.load(file_path, map_location="cpu", weights_only=True)
+            sample = {
+                "volume": payload["volume"].to(torch.float32),
+                "mask": payload["mask"].to(torch.bool),
+                "label": torch.tensor(int(payload.get("label", row["label"])), dtype=torch.long),
+                "subject_id": str(payload.get("subject_id", row.get("subject_id", idx))),
+                "site_id": str(payload.get("site_id", row.get("site_id", "UNKNOWN"))),
+            }
+            if self.cache_data:
+                self._cache[idx] = sample
+            return sample
 
         # Reorient voxel arrays to standard RAS coordinate space using canonical affine transformations
         # so that left/right, anterior/posterior, and inferior/superior axes align across scanner sites.
