@@ -117,3 +117,85 @@ def test_notebook_contains_feature_extraction_criteria(notebook_path: Path):
     assert "extract_and_cache_subject_features" in all_source or "features" in all_source
     assert "_features.pt" in all_source or ".pt" in all_source
     assert "preprocessed_manifest.csv" in all_source or "dataset-metadata.json" in all_source
+
+
+def test_stage1_to_stage2_feature_ingestion_contract(tmp_path: Path):
+    """Verify that Stage 1 exported features dataset is automatically discovered and ingested by Stage 2."""
+    import pandas as pd
+    import torch
+    from asd_classification.data.spatiotemporal import (
+        SpatioTemporalFMRIDataset,
+        discover_multisite_dataset,
+    )
+    from asd_classification.models.baseline.spatiotemporal_bimamba import SpatioTemporalBiMamba
+
+    stage1_root = tmp_path / "kaggle_input" / "abide-spatiotemporal-features"
+    features_dir = stage1_root / "features"
+    features_dir.mkdir(parents=True)
+
+    # Save mock Stage 1 feature embeddings
+    for sid in ["50003", "50004"]:
+        payload = {
+            "features": torch.randn(200, 128, dtype=torch.float32),
+            "mask": torch.ones(200, dtype=torch.bool),
+            "label": 1 if sid == "50003" else 0,
+            "subject_id": sid,
+            "site_id": "PITT",
+        }
+        torch.save(payload, features_dir / f"{sid}_features.pt")
+
+    # Save Stage 1 manifest
+    manifest_csv = stage1_root / "preprocessed_manifest.csv"
+    df = pd.DataFrame([
+        {
+            "subject_id": "50003",
+            "site_id": "PITT",
+            "label": 1,
+            "file_path": str(features_dir / "50003_features.pt"),
+            "features_file": str(features_dir / "50003_features.pt"),
+            "part_num": 4,
+        },
+        {
+            "subject_id": "50004",
+            "site_id": "PITT",
+            "label": 0,
+            "file_path": str(features_dir / "50004_features.pt"),
+            "features_file": str(features_dir / "50004_features.pt"),
+            "part_num": 4,
+        },
+    ])
+    df.to_csv(manifest_csv, index=False)
+
+    # Stage 2: Ingest via discover_multisite_dataset
+    discovered_df, file_map = discover_multisite_dataset(candidate_paths=[stage1_root])
+    assert len(discovered_df) == 2
+    assert "50003" in file_map
+    assert "50004" in file_map
+    assert file_map["50003"].is_file()
+    assert file_map["50004"].is_file()
+
+    # Pass into SpatioTemporalFMRIDataset
+    dataset = SpatioTemporalFMRIDataset(manifest=discovered_df)
+    item = dataset[0]
+    assert item["volume"].shape == (200, 128)
+    assert item["mask"].shape == (200,)
+
+    # Pass into SpatioTemporalBiMamba
+    model = SpatioTemporalBiMamba(
+        in_channels=1,
+        d_model=128,
+        num_classes=2,
+        d_state=8,
+        num_layers=1,
+        force_pure_pytorch=True,
+    )
+    model.eval()
+
+    vol_batch = item["volume"].unsqueeze(0)
+    mask_batch = item["mask"].unsqueeze(0)
+    with torch.no_grad():
+        logits, weights = model(vol_batch, mask=mask_batch)
+
+    assert logits.shape == (1, 2)
+    assert weights.shape == (1, 200)
+
