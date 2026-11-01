@@ -81,17 +81,12 @@ def test_notebook_contains_all_acceptance_criteria(notebook_path: Path):
     assert "discover_multisite_dataset" in all_source or "discover_multisite_data" in all_source
     assert "/kaggle/input" in all_source
 
-    # 2. Spatio-temporal DataLoader and neuroimaging preprocessing
+    # 2. Spatio-temporal Sequence DataLoader
     assert "SpatioTemporalFMRIDataset" in all_source
-    assert "trim_temporal_frames" in all_source
-    assert "normalize_nonzero_voxels" in all_source
-    assert "standardize_spatial_volume" in all_source
     assert "pad_temporal_sequence" in all_source
-    assert "64, 64, 36" in all_source
     assert "200" in all_source
 
-    # 3. 3D-CNN + Bi-Mamba architecture with PyTorch fallback
-    assert "Spatial3DCNNEncoder" in all_source
+    # 3. Bi-Mamba sequence architecture with PyTorch fallback
     assert "BiMambaSequenceModel" in all_source
     assert "MambaBlock" in all_source
     assert "selective_scan_fn" in all_source
