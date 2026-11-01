@@ -179,6 +179,27 @@ def test_gated_temporal_attention_pooling_mask_guarantees_zero_attention():
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), "Valid frame weights must sum to 1.0"
 
 
+def test_gated_temporal_attention_pooling_float16_precision():
+    """Verify that GatedTemporalAttentionPooling executes in float16 without overflow."""
+    batch_size = 2
+    time_steps = 50
+    dim = 128
+
+    pooling = GatedTemporalAttentionPooling(in_features=dim, latent_dim=64).half()
+    h = torch.randn(batch_size, time_steps, dim, dtype=torch.float16)
+
+    mask = torch.ones(batch_size, time_steps, dtype=torch.bool)
+    mask[0, 30:] = False
+    mask[1, 40:] = False
+
+    pooled, weights = pooling(h, mask=mask)
+    assert pooled.dtype == torch.float16
+    assert weights.dtype == torch.float16
+    assert not torch.isnan(pooled).any()
+    assert torch.all(weights[0, 30:] == 0.0)
+    assert torch.all(weights[1, 40:] == 0.0)
+
+
 def test_gated_temporal_attention_pooling_unbatched_input():
     """Verify that GatedTemporalAttentionPooling handles unbatched input (T, D)."""
     time_steps = 25
