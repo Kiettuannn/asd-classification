@@ -294,6 +294,9 @@ def train_spatiotemporal_epoch(
     use_bf16: bool = True,
     gradient_clip_norm: float = 1.0,
     accumulation_steps: int = 1,
+    epoch: Optional[int] = None,
+    total_epochs: Optional[int] = None,
+    print_freq: int = 0,
 ) -> float:
     """Execute one training epoch for Spatio-Temporal 3D-CNN + Bi-Mamba model.
 
@@ -318,6 +321,7 @@ def train_spatiotemporal_epoch(
     model.train()
     total_loss = 0.0
     total_samples = 0
+    correct = 0
     optimizer.zero_grad()
 
     device_type = "cuda" if device.type == "cuda" else "cpu"
@@ -353,8 +357,19 @@ def train_spatiotemporal_epoch(
 
         scaled_loss.backward()
 
-        total_loss += float(loss.item()) * batch_size
+        batch_loss = float(loss.item())
+        total_loss += batch_loss * batch_size
         total_samples += batch_size
+
+        if print_freq > 0:
+            preds = torch.argmax(logits.detach(), dim=-1)
+            correct += int((preds == targets).sum().item())
+            num_batches = len(dataloader)
+            if (step_idx + 1) % print_freq == 0 or (step_idx + 1) == num_batches:
+                running_loss = total_loss / max(total_samples, 1)
+                running_acc = (correct / max(total_samples, 1)) * 100.0
+                ep_prefix = f"[Epoch {epoch:2d}/{total_epochs:2d}] " if (epoch is not None and total_epochs is not None) else ""
+                print(f"    {ep_prefix}Step {step_idx + 1:2d}/{num_batches:2d} | Batch Loss: {batch_loss:.4f} | Running Loss: {running_loss:.4f} | Acc: {running_acc:5.1f}%")
 
         # Guard against gradient NaN/Inf corruption under mixed precision
         valid_grads = True
@@ -514,6 +529,7 @@ def run_spatiotemporal_kfold_cv(
     parallel_strategy: str = "auto",
     random_state: int = 42,
     model_kwargs: Optional[Dict[str, Any]] = None,
+    print_freq: int = 0,
 ) -> Dict[str, Any]:
     """Execute Site-and-Class Stratified 5-Fold Cross-Validation for Spatio-Temporal Bi-Mamba.
 
@@ -640,6 +656,9 @@ def run_spatiotemporal_kfold_cv(
                 device=exec_device,
                 use_bf16=use_bf16,
                 gradient_clip_norm=gradient_clip_norm,
+                epoch=epoch,
+                total_epochs=epochs,
+                print_freq=print_freq,
             )
 
             val_loss, val_metrics, _, _, _ = evaluate_spatiotemporal_epoch(
