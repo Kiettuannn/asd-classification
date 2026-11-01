@@ -526,6 +526,58 @@ def test_dataloader_to_bimamba_integration(tmp_path: Path):
     assert torch.allclose(attn_weights.sum(dim=-1), torch.ones(2), atol=1e-5)
 
 
+def test_spatiotemporal_dataset_loads_cached_features(tmp_path: Path):
+    """Verify SpatioTemporalFMRIDataset loads pre-extracted 3D spatial feature tensors (.pt)."""
+    pt_dir = tmp_path / "cached_features"
+    pt_dir.mkdir(parents=True)
+
+    # Save synthetic cached feature files
+    for sid in ["sub1", "sub2"]:
+        feat_payload = {
+            "features": torch.randn(200, 128, dtype=torch.float32),
+            "mask": torch.ones(200, dtype=torch.bool),
+            "label": 1 if sid == "sub1" else 0,
+            "subject_id": sid,
+            "site_id": "NYU",
+        }
+        torch.save(feat_payload, pt_dir / f"{sid}_features.pt")
+
+    manifest = pd.DataFrame([
+        {"subject_id": "sub1", "site_id": "NYU", "label": 1, "file_path": str(pt_dir / "sub1_features.pt")},
+        {"subject_id": "sub2", "site_id": "NYU", "label": 0, "file_path": str(pt_dir / "sub2_features.pt")},
+    ])
+
+    dataset = SpatioTemporalFMRIDataset(manifest=manifest)
+    assert len(dataset) == 2
+
+    item0 = dataset[0]
+    assert "volume" in item0
+    assert item0["volume"].shape == (200, 128)
+    assert item0["mask"].shape == (200,)
+
+    loader = create_spatiotemporal_dataloader(dataset, batch_size=2, shuffle=False)
+    batch = next(iter(loader))
+    assert batch["volume"].shape == (2, 200, 128)
+
+    from asd_classification.models.baseline.spatiotemporal_bimamba import SpatioTemporalBiMamba
+    model = SpatioTemporalBiMamba(
+        in_channels=1,
+        d_model=128,
+        num_classes=2,
+        d_state=8,
+        num_layers=1,
+        force_pure_pytorch=True,
+    )
+    model.eval()
+
+    with torch.no_grad():
+        logits, weights = model(batch["volume"], mask=batch["mask"])
+
+    assert logits.shape == (2, 2)
+    assert weights.shape == (2, 200)
+
+
+
 
 
 

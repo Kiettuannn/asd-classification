@@ -381,4 +381,34 @@ def test_spatiotemporal_bimamba_spatial_feature_caching_parity():
     assert torch.allclose(direct_weights, cached_weights, atol=1e-5)
 
 
+def test_spatiotemporal_bimamba_direct_3d_tensor_forward():
+    """Verify that SpatioTemporalBiMamba directly accepts pre-extracted 3D feature tensors (B, T, d_model)."""
+    batch_size = 2
+    time_steps = 5
+    d_model = 64
+    model = SpatioTemporalBiMamba(
+        in_channels=1,
+        d_model=d_model,
+        d_state=8,
+        expand=2,
+        num_layers=2,
+        num_classes=2,
+        force_pure_pytorch=True,
+    )
+    model.eval()
+
+    # Pre-extracted 3D spatial feature sequence (B, T, d_model)
+    features_3d = torch.randn(batch_size, time_steps, d_model)
+    mask = torch.ones(batch_size, time_steps, dtype=torch.bool)
+
+    with torch.no_grad():
+        logits, weights = model(features_3d, mask=mask)
+
+    assert logits.shape == (batch_size, 2)
+    assert weights.shape == (batch_size, time_steps)
+    assert not torch.isnan(logits).any()
+    assert not torch.isnan(weights).any()
+
+
+
 

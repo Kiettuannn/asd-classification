@@ -706,16 +706,21 @@ class SpatioTemporalFMRIDataset(Dataset):
         # Direct loading for preprocessed PyTorch tensor artifacts (.pt)
         if file_path.suffix == ".pt":
             payload = torch.load(file_path, map_location="cpu", weights_only=True)
+            # Support both raw 4D volume tensors and pre-extracted 3D spatial feature sequences
+            vol_data = payload["features"] if "features" in payload else payload["volume"]
             sample = {
-                "volume": payload["volume"].to(torch.float32),
+                "volume": vol_data.to(torch.float32),
                 "mask": payload["mask"].to(torch.bool),
                 "label": torch.tensor(int(payload.get("label", row["label"])), dtype=torch.long),
                 "subject_id": str(payload.get("subject_id", row.get("subject_id", idx))),
                 "site_id": str(payload.get("site_id", row.get("site_id", "UNKNOWN"))),
             }
+            if "features" in payload:
+                sample["features"] = vol_data.to(torch.float32)
             if self.cache_data:
                 self._cache[idx] = sample
             return sample
+
 
         # Reorient voxel arrays to standard RAS coordinate space using canonical affine transformations
         # so that left/right, anterior/posterior, and inferior/superior axes align across scanner sites.

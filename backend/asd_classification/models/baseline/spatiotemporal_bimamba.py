@@ -788,10 +788,13 @@ class SpatioTemporalBiMamba(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """End-to-end forward pass mapping 5D neuroimaging batches to diagnostic logits.
+        """End-to-end forward pass mapping neuroimaging batches or cached features to diagnostic logits.
+
+        Supports both raw 5D/6D neuroimaging sequences and 3D pre-extracted spatial feature
+        sequences of shape (B, T, d_model) from offline feature caching pipelines.
 
         Args:
-            x: Input 5D neuroimaging sequence batch of shape (B, T, C, H, W, D).
+            x: Input 5D/6D neuroimaging sequence batch or 3D pre-extracted feature tensor (B, T, d_model).
             mask: Optional boolean temporal mask of shape (B, T).
 
         Returns:
@@ -799,7 +802,12 @@ class SpatioTemporalBiMamba(nn.Module):
             - logits: Diagnostic class logits of shape (B, num_classes).
             - attention_weights: Temporal attention distribution of shape (B, T).
         """
+        if x.dim() == 3:
+            # Bypass volumetric 3D-CNN when receiving cached spatial feature representations
+            return self.forward_from_spatial_features(x, mask=mask)
+
         spatial_features = self.extract_spatial_features(x)
         return self.forward_from_spatial_features(spatial_features, mask=mask)
+
 
 
