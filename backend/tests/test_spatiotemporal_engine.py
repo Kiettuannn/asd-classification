@@ -83,6 +83,11 @@ def test_compute_fold_class_weights_balanced_and_imbalanced():
     expected_ratio = 0.25 / (1.0 - 0.25)  # 0.25 / 0.75 = 1/3
     assert np.isclose(ratio, expected_ratio, rtol=1e-3)
 
+    # Balanced fold with alpha=None should produce exact 1.0 weights
+    weights_none = compute_fold_class_weights(balanced_labels, alpha=None)
+    assert np.isclose(weights_none[0].item(), 1.0, rtol=1e-3)
+    assert np.isclose(weights_none[1].item(), 1.0, rtol=1e-3)
+
     # Imbalanced fold: 80 TC (0), 20 ASD (1) (e.g. 4:1 imbalance)
     imbalanced_labels = np.array([0] * 80 + [1] * 20)
     weights_imb = compute_fold_class_weights(imbalanced_labels, alpha=0.25)

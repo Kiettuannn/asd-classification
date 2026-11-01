@@ -519,7 +519,7 @@ def run_spatiotemporal_kfold_cv(
     n_splits: int = 5,
     epochs: int = 30,
     batch_size: int = 2,
-    learning_rate: float = 1e-4,
+    learning_rate: float = 2e-4,
     weight_decay: float = 1e-4,
     gradient_clip_norm: float = 1.0,
     early_stopping_patience: int = 15,
@@ -589,9 +589,9 @@ def run_spatiotemporal_kfold_cv(
 
     for fold_idx, (train_indices, val_indices) in enumerate(folds, 1):
         train_labels = manifest.iloc[train_indices][label_col].to_numpy()
-        class_weights = compute_fold_class_weights(train_labels, alpha=0.25).to(exec_device)
+        class_weights = compute_fold_class_weights(train_labels, alpha=None).to(exec_device)
 
-        criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+        criterion = FocalLoss(alpha=class_weights, gamma=1.0)
 
         # Instantiate fresh architecture instance per fold to eliminate cross-fold weight leakage
         model = SpatioTemporalBiMamba(**m_kwargs)
