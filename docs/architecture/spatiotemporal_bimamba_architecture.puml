@@ -1,0 +1,131 @@
+@startuml SpatioTemporal_BiMamba_Architecture
+!theme plain
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 11
+skinparam roundcorner 8
+skinparam shadowing false
+skinparam linetype ortho
+skinparam nodesep 40
+skinparam ranksep 35
+
+' Color Palette Definition
+!define COLOR_BG_DATA #E3F2FD
+!define COLOR_BORDER_DATA #1565C0
+!define COLOR_BG_CNN #EDE7F6
+!define COLOR_BORDER_CNN #4527A0
+!define COLOR_BG_CACHE #ECEFF1
+!define COLOR_BORDER_CACHE #37474F
+!define COLOR_BG_MAMBA #FFF3E0
+!define COLOR_BORDER_MAMBA #E65100
+!define COLOR_BG_ATTN #E8F5E9
+!define COLOR_BORDER_ATTN #2E7D32
+!define COLOR_BG_HEAD #FCE4EC
+!define COLOR_BORDER_HEAD #AD1457
+
+title <b>End-to-End Spatio-Temporal 3D-CNN + Bidirectional Mamba Architecture for ASD Classification</b>\n<size:11>Multi-Site Resting-State fMRI Dynamic Representation Learning (ABIDE Cohort, N=1,089)</size>
+
+' ==============================================================================
+' STAGE 0: DATA PREPROCESSING
+' ==============================================================================
+package "Stage 0: Standardized Neuroimaging Preprocessing" as Stage0 COLOR_BG_DATA {
+    class "Raw 4D rs-fMRI Acquisition\n[ABIDE 20 Global Sites]\nFormat: NIfTI (.nii.gz)\nShape: (H, W, D, T_raw)" as RawMRI <<Input>> COLOR_BG_DATA
+    
+    class "Temporal Boundary Trimming\ntrim_temporal_frames()\nRemove first 10 & last 10 buffer frames\nEliminates T1 equilibrium & termination noise" as TrimOp COLOR_BG_DATA
+    
+    class "Non-Zero Voxel Normalization\nnormalize_nonzero_voxels()\nz-score intensity scaling strictly within brain mask\nMean = 0.0, Std = 1.0 (Zero-background preserved)" as NormOp COLOR_BG_DATA
+    
+    class "Spatial Grid Standardization\nstandardize_spatial_volume()\nCenter-cropping / zero-padding\nShape: (64, 64, 36) per time frame" as GridOp COLOR_BG_DATA
+    
+    class "Temporal Sequence Padding\npad_temporal_sequence()\nAligns subject frames to T_max = 200\nGenerates Boolean Mask: mask in {0, 1}^200" as PadOp COLOR_BG_DATA
+
+    RawMRI --> TrimOp
+    TrimOp --> NormOp
+    NormOp --> GridOp
+    GridOp --> PadOp
+}
+
+' ==============================================================================
+' STAGE 1: SPATIAL 3D-CNN FEATURE EXTRACTION
+' ==============================================================================
+package "Stage 1: Spatial 3D-CNN Encoder (Pre-trained on Mean Volumes)" as Stage1 COLOR_BG_CNN {
+    class "Standardized 4D Input Stream\nShape per Subject: (T_sub, 1, 64, 64, 36)" as Stream4D COLOR_BG_CNN
+
+    class "3D-CNN Block 1\nConv3D(1 -> 32, kernel=3, padding=1)\nBatchNorm3D(32)\nLeakyReLU(slope=0.01)\nMaxPool3D(kernel=2, stride=2)\nOutput: (32, 32, 32, 18)" as Block1 COLOR_BG_CNN
+
+    class "3D-CNN Block 2\nConv3D(32 -> 64, kernel=3, padding=1)\nBatchNorm3D(64)\nLeakyReLU(slope=0.01)\nMaxPool3D(kernel=2, stride=2)\nOutput: (64, 16, 16, 9)" as Block2 COLOR_BG_CNN
+
+    class "3D-CNN Block 3\nConv3D(64 -> 128, kernel=3, padding=1)\nBatchNorm3D(128)\nLeakyReLU(slope=0.01)\nMaxPool3D(kernel=2, stride=2)\nOutput: (128, 8, 8, 4)" as Block3 COLOR_BG_CNN
+
+    class "3D-CNN Block 4\nConv3D(128 -> 256, kernel=3, padding=1)\nBatchNorm3D(256)\nLeakyReLU(slope=0.01)\nMaxPool3D(kernel=2, stride=2)\nOutput: (256, 4, 4, 2)" as Block4 COLOR_BG_CNN
+
+    class "Spatial Compression & Latent Projection\nAdaptiveAvgPool3D((1, 1, 1)) -> Flatten(256)\nDropout(p=0.1)\nLinear(256 -> 128)\nOutput per frame: 128-dimensional embedding" as SpatialFC COLOR_BG_CNN
+
+    Stream4D --> Block1
+    Block1 --> Block2
+    Block2 --> Block3
+    Block3 --> Block4
+    Block4 --> SpatialFC
+}
+
+PadOp --> Stream4D : "Temporal Frames\n(chunk_size=32)"
+
+' ==============================================================================
+' INTERMEDIATE FEATURE CACHE SEAM
+' ==============================================================================
+package "Intermediate Sequence Cache (Fast Stage 2 Ingestion)" as CacheSeam COLOR_BG_CACHE {
+    class "Cached Sequence Tensor (.pt)\nFeatures: Tensor of shape (200, 128)\nAttention Mask: Boolean [200]\nMetadata: {subject_id, site_id, label}" as CachedPT <<Storage>> COLOR_BG_CACHE
+}
+
+SpatialFC --> CachedPT : "Serialized Feature Extraction\n(1,089 Subjects Cached in 12.5 min)"
+
+' ==============================================================================
+' STAGE 2: TEMPORAL BIDIRECTIONAL MAMBA
+' ==============================================================================
+package "Stage 2: 2-Layer Bidirectional Mamba Sequence Backbone" as Stage2 COLOR_BG_MAMBA {
+    class "Sequence Batch Loader\nBatch Tensor: (B, T=200, D=128)\nBatch Mask: (B, T=200)" as SeqBatch COLOR_BG_MAMBA
+
+    class "Forward Mamba Branch (Layer L)\nh_norm = LayerNorm(128)(h)\nSelectiveScan(u_t, delta_t, A, B_t, C_t, D)\nh_t = A_bar * h_{t-1} + B_bar * u_t\ny_fwd = C_t * h_t + D * u_t" as FwdMamba COLOR_BG_MAMBA
+
+    class "Backward Mamba Branch (Layer L)\nh_rev = ReverseScan(h, mask)\nh_norm_rev = LayerNorm(128)(h_rev)\nSelectiveScan(u_t_rev, delta, A, B, C, D)\ny_bwd = UnreverseScan(y_bwd_raw, mask)" as BwdMamba COLOR_BG_MAMBA
+
+    class "Directional Merge & Skip Connection\nMerged = Linear(256 -> 128)(Concat[y_fwd, y_bwd])\nh_{next} = h + Dropout(0.1)(Merged)\nOutput: (B, 200, 128)" as MergeMamba COLOR_BG_MAMBA
+
+    SeqBatch --> FwdMamba
+    SeqBatch --> BwdMamba
+    FwdMamba --> MergeMamba
+    BwdMamba --> MergeMamba
+}
+
+CachedPT --> SeqBatch : "DataLoader\nBatch Size = 16"
+
+' ==============================================================================
+' STAGE 3: GATED TEMPORAL ATTENTION POOLING
+' ==============================================================================
+package "Stage 3: Gated Temporal Attention Pooling & Interpretability" as Stage3 COLOR_BG_ATTN {
+    class "Gated Dual-Projection Mechanism\nV = tanh(Linear(128 -> 64)(H))\nU = sigmoid(Linear(128 -> 64)(H))\nG = Dropout(0.0)(V (x) U)" as GatedProj COLOR_BG_ATTN
+
+    class "Pre-Softmax Temporal Masking\nScores S = Linear(64 -> 1)(G).squeeze(-1)\nS_masked = S.masked_fill(~mask, -1e4 / -1e9)\nWeights alpha = softmax(S_masked, dim=time)" as AttnScores COLOR_BG_ATTN
+
+    class "Attention-Weighted Pooling & Trajectory Export\nPooled Representation c = sum_{t=1}^{T} (alpha_t * h_t)\nOutput Vector: (B, 128)\nInterpretability: alpha_t across Scan Acquisition Time" as AttnPooled COLOR_BG_ATTN
+
+    MergeMamba --> GatedProj : "Contextual Hidden States\nH in R^{B x 200 x 128}"
+    GatedProj --> AttnScores
+    AttnScores --> AttnPooled
+}
+
+' ==============================================================================
+' STAGE 4: CLASSIFICATION HEAD & CLINICAL EVALUATION
+' ==============================================================================
+package "Stage 4: Diagnostic Classification Head & Supervised Optimization" as Stage4 COLOR_BG_HEAD {
+    class "Classification Projection Head\nLayerNorm(128)\nDropout(p=0.4)\nLinear(128 -> 2)" as HeadBlock COLOR_BG_HEAD
+
+    class "Diagnostic Decision Output\nSoftmax Probabilities:\nP(ASD = 1) vs. P(Control = 0)\nBinary argmax prediction" as OutputDec COLOR_BG_HEAD
+
+    class "Joint Stratified Evaluation & Loss\nBalanced Focal Loss (alpha=None, gamma=1.0)\nInverse Fold Frequency Weights: [w_0, w_1]\nAdamW (lr=2e-4, weight_decay=1e-4) + Cosine Annealing\n5-Fold Stratified CV across (site_id, label)" as LossOptim COLOR_BG_HEAD
+
+    AttnPooled --> HeadBlock : "Subject Representation\nc in R^{B x 128}"
+    HeadBlock --> OutputDec
+    OutputDec --> LossOptim
+}
+
+@enduml
