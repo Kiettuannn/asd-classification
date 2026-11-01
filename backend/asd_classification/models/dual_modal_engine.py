@@ -367,6 +367,48 @@ class DualModalBrainNetModel(BaseBrainModel):
 
         return {"loss": loss, "accuracy": acc}
 
+    def explain(
+        self,
+        sample: Any,
+        top_k: int = 10,
+        target_class: int = 1,
+        compute_fidelity: bool = True,
+        generate_plots: bool = False,
+        plot_output_dir: Optional[Union[str, Path]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Explain diagnostic predictions using E2N Grad-CAM, CC200-Yeo7 enrichment, and fidelity tests.
+
+        Args:
+            sample: Functional connectivity matrix or tensor (200, 200) or (1, 1, 200, 200).
+            top_k: Number of most influential CC200 regions of interest to return.
+            target_class: Target diagnostic class index (1 = ASD, 0 = TD).
+            compute_fidelity: If True, evaluates quantitative Fidelity+ and Fidelity- metrics.
+            generate_plots: If True, produces publication-grade 3D glass brain and enrichment plots.
+            plot_output_dir: Optional filesystem path for persisting generated figures.
+
+        Returns:
+            Structured dictionary matching Issue #29 and Issue #32 explainability specifications:
+            {
+                "salient_rois": List[Dict[str, Any]],
+                "network_enrichment": Dict[str, float],
+                "fidelity": Dict[str, float],
+                "figures": Optional[Dict[str, str]],
+            }
+        """
+        from asd_classification.models.explainability import NeuroExplainabilitySuite
+
+        suite = NeuroExplainabilitySuite(self)
+        return suite.explain_subject(
+            fc_matrix=sample,
+            top_k=top_k,
+            target_class=target_class,
+            compute_fidelity=compute_fidelity,
+            generate_plots=generate_plots,
+            plot_output_dir=plot_output_dir,
+        )
+
     def save(self, file_path: Path) -> None:
         """
         Persist model weights, configuration parameters, and loss state to disk.
