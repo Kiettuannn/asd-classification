@@ -1,7 +1,7 @@
 """Graph Convolutional Network (GCN) architecture for whole-brain graph classification."""
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import numpy as np
 
 from asd_classification.models.base import BaseBrainModel
@@ -26,7 +26,7 @@ class BrainGCN(BaseBrainModel):
         self.dropout = dropout
         self.model: Any = None
 
-    def fit(self, X: Any, y: np.ndarray, **kwargs: Any) -> "BrainGCN":
+    def fit(self, X: Any, y: Optional[np.ndarray] = None, **kwargs: Any) -> "BrainGCN":
         """Trains GCN using PyG DataLoader and Adam optimizer."""
         raise NotImplementedError("Implementation will be added in implementation phase.")
 

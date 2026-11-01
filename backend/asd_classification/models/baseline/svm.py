@@ -16,7 +16,7 @@ class SVMClassifier(BaseBrainModel):
         self.gamma = gamma
         self.pipeline: Optional[Any] = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray, **kwargs: Any) -> "SVMClassifier":
+    def fit(self, X: Any, y: Optional[np.ndarray] = None, **kwargs: Any) -> "SVMClassifier":
         """Fits StandardScaler and SVC on flattened upper-triangle FC vectors."""
         raise NotImplementedError("Implementation will be added in implementation phase.")
 

@@ -1,7 +1,7 @@
 """Graph Attention Network (GAT) architecture with multi-head attention and explainability."""
 
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from asd_classification.models.base import BaseBrainModel
@@ -28,7 +28,7 @@ class BrainGAT(BaseBrainModel):
         self.dropout = dropout
         self.model: Any = None
 
-    def fit(self, X: Any, y: np.ndarray, **kwargs: Any) -> "BrainGAT":
+    def fit(self, X: Any, y: Optional[np.ndarray] = None, **kwargs: Any) -> "BrainGAT":
         """Trains GAT using PyG DataLoader and Adam optimizer."""
         raise NotImplementedError("Implementation will be added in implementation phase.")
 

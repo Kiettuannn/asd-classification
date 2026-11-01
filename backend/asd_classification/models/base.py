@@ -10,7 +10,7 @@ class BaseBrainModel(ABC):
     """Unified interface for both classical and deep learning brain connectivity models."""
 
     @abstractmethod
-    def fit(self, X: Any, y: np.ndarray, **kwargs: Any) -> "BaseBrainModel":
+    def fit(self, X: Any, y: Optional[np.ndarray] = None, **kwargs: Any) -> "BaseBrainModel":
         """Train the model on the provided connectivity data."""
         pass
 

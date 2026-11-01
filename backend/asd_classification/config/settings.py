@@ -11,9 +11,9 @@ except ImportError:
     # Graceful fallback if pydantic-settings is not yet installed in active environment
     from pydantic import BaseModel as BaseSettings, Field  # type: ignore
 
-    class SettingsConfigDict:  # type: ignore
+    class SettingsConfigDict(dict):  # type: ignore
         def __init__(self, **kwargs):
-            pass
+            super().__init__(**kwargs)
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
