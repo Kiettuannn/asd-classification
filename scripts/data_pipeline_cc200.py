@@ -4,11 +4,12 @@ Data Ingestion, Preprocessing, and Phenotypic Text Generation for ABIDE I CC200.
 This module provides standalone utilities for:
 1. Fetching and indexing Craddock CC200 ROI time-series via Nilearn ABIDE PCP.
 2. Motion quality control scrubbing (filtering subjects by Mean Framewise Displacement).
-3. Riemannian Tangent Space Functional Connectivity (FC) estimation.
+3. Riemannian Tangent Space Functional Connectivity (FC) estimation with fold-wise fitting.
 4. Non-leaking clinical phenotypic prompt formulation (without diagnostic targets).
 5. Joint Site-and-Class Stratified K-Fold partitioning and PyTorch DataLoaders.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple, Union
 import warnings
@@ -26,6 +27,18 @@ try:
     HAS_NILEARN = True
 except ImportError:
     HAS_NILEARN = False
+
+
+@dataclass
+class CohortDataBundle:
+    """Encapsulates aligned cohort tensors and clinical phenotypic attributes."""
+    fc_matrices: np.ndarray  # Shape: (N, n_rois, n_rois)
+    text_prompts: List[str]  # Length: N
+    labels: np.ndarray  # Shape: (N,) binary targets (1 = ASD, 0 = TC)
+    site_ids: np.ndarray  # Shape: (N,) string identifiers
+    site_codes: np.ndarray  # Shape: (N,) integer encoded identifiers
+    site_to_idx: Dict[str, int]  # Mapping from site name to integer code
+    pheno_df: pd.DataFrame  # Filtered metadata
 
 
 def filter_motion_quality(
@@ -60,10 +73,14 @@ def compute_tangent_fc(
     """
     Compute Riemannian Tangent Space Functional Connectivity matrices.
 
+    To eliminate cross-validation data leakage, fit_indices should supply the
+    indices of training subjects. The reference Riemannian mean covariance is
+    estimated strictly on the training set and then projected onto all subjects.
+
     Args:
         time_series_list: List of 2D arrays, each of shape (n_timepoints, n_rois).
-        fit_indices: Optional indices of subjects used to fit the reference Riemannian mean.
-            If None, the measure is fit on all provided subjects.
+        fit_indices: Optional subject indices to fit the Riemannian mean covariance.
+            If None, the measure is fit on all provided time series.
 
     Returns:
         Array of symmetric FC matrices of shape (n_subjects, n_rois, n_rois), dtype float32.
@@ -83,9 +100,7 @@ def compute_tangent_fc(
     else:
         matrices = measure.fit_transform(time_series_list)
 
-    # Ensure float32 precision for PyTorch tensor operations
-    matrices = np.asarray(matrices, dtype=np.float32)
-    return matrices
+    return np.asarray(matrices, dtype=np.float32)
 
 
 def _clean_numeric_field(val: Union[float, int, str]) -> Optional[float]:
@@ -99,6 +114,11 @@ def _clean_numeric_field(val: Union[float, int, str]) -> Optional[float]:
         return f_val
     except (ValueError, TypeError):
         return None
+
+
+def _format_score(val: Optional[float]) -> str:
+    """Helper to format numeric score or return standard missing token."""
+    return f"{val:.0f}" if val is not None else "not documented"
 
 
 def generate_phenotypic_prompts(pheno_df: pd.DataFrame) -> List[str]:
@@ -119,42 +139,28 @@ def generate_phenotypic_prompts(pheno_df: pd.DataFrame) -> List[str]:
     prompts = []
 
     for _, row in pheno_df.iterrows():
-        # Sanitize Age
         age = _clean_numeric_field(row.get("AGE_AT_SCAN", None))
         age_str = f"{age:.1f}" if age is not None else "not documented"
 
-        # Sanitize Sex (ABIDE encoding: 1 = Male, 2 = Female)
         raw_sex = row.get("SEX", None)
         if raw_sex in (1, "1", "M", "Male", "male"):
-            sex_str = "male"
+            subject_descriptor = f"{age_str}-year-old male"
         elif raw_sex in (2, "2", "F", "Female", "female"):
-            sex_str = "female"
+            subject_descriptor = f"{age_str}-year-old female"
         else:
-            sex_str = "individual"
+            subject_descriptor = f"{age_str}-year-old individual"
 
-        # Sanitize Cognitive Scores (IQ)
-        fiq = _clean_numeric_field(row.get("FIQ", None))
-        fiq_str = f"{fiq:.0f}" if fiq is not None else "not documented"
+        fiq_str = _format_score(_clean_numeric_field(row.get("FIQ", None)))
+        viq_str = _format_score(_clean_numeric_field(row.get("VIQ", None)))
 
-        viq = _clean_numeric_field(row.get("VIQ", None))
-        viq_str = f"{viq:.0f}" if viq is not None else "not documented"
+        ados_soc_str = _format_score(_clean_numeric_field(row.get("ADOS_SOCIAL", None)))
+        ados_rep_behav_str = _format_score(_clean_numeric_field(row.get("ADOS_STEREO_BEHAV", None)))
 
-        # Sanitize ADOS Behavioral Subscores
-        ados_soc = _clean_numeric_field(row.get("ADOS_SOCIAL", None))
-        if ados_soc is None:
-            # Fall back to ADOS_TOTAL or ADOS_COMM if available
-            ados_soc = _clean_numeric_field(row.get("ADOS_TOTAL", None))
-        ados_soc_str = f"{ados_soc:.0f}" if ados_soc is not None else "not documented"
-
-        ados_rbr = _clean_numeric_field(row.get("ADOS_STEREO_BEHAV", None))
-        ados_rbr_str = f"{ados_rbr:.0f}" if ados_rbr is not None else "not documented"
-
-        # Compose clinical template without any diagnostic label keywords
         prompt = (
-            f"A {age_str}-year-old {sex_str} individual, "
+            f"A {subject_descriptor}, "
             f"Full-scale IQ {fiq_str}, Verbal IQ {viq_str}, "
             f"evaluated on ADOS with Social-Affect score {ados_soc_str} "
-            f"and Repetitive Behavior score {ados_rbr_str}."
+            f"and Repetitive Behavior score {ados_rep_behav_str}."
         )
         prompts.append(prompt)
 
@@ -167,8 +173,8 @@ def create_joint_stratified_kfold(
     """
     Create Stratified K-Fold cross-validation splits balanced across both diagnosis and site.
 
-    If certain site-diagnosis combinations have fewer than n_splits instances, they are
-    grouped gracefully to avoid StratifiedKFold population errors while preserving class balance.
+    Uses composite multi-factor stratification to balance scanner site representations
+    and diagnostic classes without dropping site covariates.
 
     Args:
         pheno_df: Phenotypic DataFrame containing 'DX_GROUP' and 'SITE_ID'.
@@ -182,28 +188,32 @@ def create_joint_stratified_kfold(
     if n_samples < n_splits:
         raise ValueError(f"Number of samples ({n_samples}) must be >= n_splits ({n_splits}).")
 
-    dx_col = pheno_df["DX_GROUP"].astype(str) if "DX_GROUP" in pheno_df.columns else pd.Series(["0"] * n_samples)
-    site_col = pheno_df["SITE_ID"].astype(str) if "SITE_ID" in pheno_df.columns else pd.Series(["SITE"] * n_samples)
+    dx_series = pheno_df["DX_GROUP"].astype(str) if "DX_GROUP" in pheno_df.columns else pd.Series(["0"] * n_samples)
+    site_series = pheno_df["SITE_ID"].astype(str) if "SITE_ID" in pheno_df.columns else pd.Series(["SITE"] * n_samples)
 
-    # Initial joint stratification key
-    raw_strata = site_col + "_" + dx_col
-    strata_counts = raw_strata.value_counts()
+    # Bin sites by frequency so smaller scanner sites are aggregated by class
+    site_counts = site_series.value_counts()
+    major_sites = set(site_counts[site_counts >= n_splits].index)
 
-    # Re-group rare combinations (< n_splits) by class only to maintain feasibility
-    adjusted_strata = []
-    for s_val, d_val in zip(site_col, dx_col):
-        key = f"{s_val}_{d_val}"
-        if strata_counts.get(key, 0) >= n_splits:
-            adjusted_strata.append(key)
+    binned_strata = []
+    for site, dx in zip(site_series, dx_series):
+        if site in major_sites:
+            binned_strata.append(f"{site}_{dx}")
         else:
-            adjusted_strata.append(f"rare_{d_val}")
+            binned_strata.append(f"MINOR_SITE_{dx}")
 
-    # Fallback to diagnostic class directly if rare grouping still has small strata
-    final_counts = pd.Series(adjusted_strata).value_counts()
-    if (final_counts < n_splits).any():
-        final_strata = dx_col.values
+    strata_counts = pd.Series(binned_strata).value_counts()
+    if (strata_counts < 2).any():
+        final_strata = dx_series.values
     else:
-        final_strata = np.array(adjusted_strata)
+        min_count = strata_counts.min()
+        if min_count < n_splits:
+            final_strata = [
+                s if strata_counts[s] >= n_splits else f"COMBINED_{dx}"
+                for s, dx in zip(binned_strata, dx_series)
+            ]
+        else:
+            final_strata = binned_strata
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     dummy_x = np.zeros(n_samples)
@@ -214,13 +224,13 @@ def create_joint_stratified_kfold(
 
 class ABIDETangentDataset(Dataset):
     """
-    PyTorch Dataset yielding (fc_tensor, phenotypic_prompt, label, site_id).
+    PyTorch Dataset yielding (fc_tensor, phenotypic_prompt, label, site_code).
 
     Tensors emitted:
         fc_tensor: torch.FloatTensor of shape (1, n_rois, n_rois).
         prompt: str representing patient clinical profile.
         label: torch.LongTensor with 0 for Typically Developing (TC), 1 for ASD.
-        site_id: str representing scanning site identifier.
+        site_code: torch.LongTensor representing integer-encoded scanner site.
     """
 
     def __init__(
@@ -228,47 +238,42 @@ class ABIDETangentDataset(Dataset):
         fc_matrices: np.ndarray,
         text_prompts: List[str],
         labels: np.ndarray,
-        site_ids: Union[np.ndarray, List[str]],
+        site_codes: np.ndarray,
+        site_ids: Optional[Union[np.ndarray, List[str]]] = None,
     ):
-        assert len(fc_matrices) == len(text_prompts) == len(labels) == len(site_ids), (
+        assert len(fc_matrices) == len(text_prompts) == len(labels) == len(site_codes), (
             f"Mismatched dataset lengths: fc={len(fc_matrices)}, text={len(text_prompts)}, "
-            f"labels={len(labels)}, sites={len(site_ids)}"
+            f"labels={len(labels)}, site_codes={len(site_codes)}"
         )
         self.fc_matrices = np.asarray(fc_matrices, dtype=np.float32)
         self.text_prompts = list(text_prompts)
         self.labels = np.asarray(labels, dtype=np.int64)
-        self.site_ids = list(site_ids)
+        self.site_codes = np.asarray(site_codes, dtype=np.int64)
+        self.site_ids = list(site_ids) if site_ids is not None else [str(c) for c in site_codes]
 
     def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, torch.Tensor, str]:
-        # Shape: (1, n_rois, n_rois) for convolution operations in BrainNetCNN
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, torch.Tensor, torch.Tensor]:
         fc_tensor = torch.from_numpy(self.fc_matrices[idx]).unsqueeze(0).float()
         prompt = self.text_prompts[idx]
         label = torch.tensor(self.labels[idx], dtype=torch.long)
-        site_id = str(self.site_ids[idx])
-        return fc_tensor, prompt, label, site_id
+        site_code = torch.tensor(self.site_codes[idx], dtype=torch.long)
+        return fc_tensor, prompt, label, site_code
 
 
 def create_dataloaders(
-    fc_matrices: np.ndarray,
-    text_prompts: List[str],
-    labels: np.ndarray,
-    site_ids: Union[np.ndarray, List[str]],
+    bundle: CohortDataBundle,
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     batch_size: int = 16,
     num_workers: int = 0,
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    Construct training and validation PyTorch DataLoaders for a cross-validation fold.
+    Construct training and validation PyTorch DataLoaders from a CohortDataBundle.
 
     Args:
-        fc_matrices: Full array of shape (N, n_rois, n_rois).
-        text_prompts: Full list of clinical prompt strings.
-        labels: Full array of diagnostic labels (0 or 1).
-        site_ids: Full list or array of site identifiers.
+        bundle: Preprocessed CohortDataBundle instance.
         train_idx: Subject indices assigned to training.
         val_idx: Subject indices assigned to validation.
         batch_size: Mini-batch size.
@@ -277,46 +282,31 @@ def create_dataloaders(
     Returns:
         Tuple of (train_loader, val_loader).
     """
-    train_dataset = ABIDETangentDataset(
-        fc_matrices=fc_matrices[train_idx],
-        text_prompts=[text_prompts[i] for i in train_idx],
-        labels=labels[train_idx],
-        site_ids=[site_ids[i] for i in train_idx],
-    )
+    def _make_loader(indices: np.ndarray, shuffle: bool) -> DataLoader:
+        dataset = ABIDETangentDataset(
+            fc_matrices=bundle.fc_matrices[indices],
+            text_prompts=[bundle.text_prompts[i] for i in indices],
+            labels=bundle.labels[indices],
+            site_codes=bundle.site_codes[indices],
+            site_ids=[bundle.site_ids[i] for i in indices],
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
 
-    val_dataset = ABIDETangentDataset(
-        fc_matrices=fc_matrices[val_idx],
-        text_prompts=[text_prompts[i] for i in val_idx],
-        labels=labels[val_idx],
-        site_ids=[site_ids[i] for i in val_idx],
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-    )
-
-    return train_loader, val_loader
+    return _make_loader(train_idx, shuffle=True), _make_loader(val_idx, shuffle=False)
 
 
 def load_abide_cc200_dataset(
     data_dir: Optional[Union[str, Path]] = None,
     n_subjects: Optional[int] = None,
     max_fd: float = 0.5,
-) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray, pd.DataFrame]:
+) -> CohortDataBundle:
     """
     High-level automated pipeline to fetch, clean, and extract CC200 Tangent FC matrices.
 
@@ -326,12 +316,7 @@ def load_abide_cc200_dataset(
         max_fd: Motion filtering threshold for Mean Framewise Displacement (in mm).
 
     Returns:
-        Tuple of:
-            - fc_matrices: Array of shape (N_clean, 200, 200), dtype float32.
-            - text_prompts: List of N_clean non-leaking clinical prompt strings.
-            - labels: Integer array (N_clean,) where 1 = ASD, 0 = Typically Developing.
-            - site_ids: String array (N_clean,) with scanner site identifiers.
-            - clean_pheno_df: Filtered phenotypic DataFrame.
+        CohortDataBundle with FC matrices, prompt strings, binary labels, site codes, and metadata.
     """
     if not HAS_NILEARN:
         raise ImportError("nilearn is required to fetch and parse ABIDE PCP datasets.")
@@ -353,11 +338,9 @@ def load_abide_cc200_dataset(
     print(f"INFO: Ingested {len(pheno_df)} raw subject records. Applying motion filter (max_fd={max_fd})...")
     clean_pheno_df, keep_mask = filter_motion_quality(pheno_df, max_fd=max_fd)
 
-    # Filter aligned time-series files
     clean_files = [f for f, keep in zip(time_series_files, keep_mask) if keep]
     print(f"INFO: {len(clean_files)} subjects passed quality control.")
 
-    # Read and validate BOLD time-series
     time_series_list = []
     valid_indices = []
     for idx, f_path in enumerate(clean_files):
@@ -377,10 +360,21 @@ def load_abide_cc200_dataset(
     print("INFO: Formulating non-leaking phenotypic clinical prompts...")
     text_prompts = generate_phenotypic_prompts(clean_pheno_df)
 
-    # In ABIDE: DX_GROUP 1 = ASD, 2 = Control. Convert to binary: 1 = ASD, 0 = Control
     raw_dx = clean_pheno_df["DX_GROUP"].values
     labels = np.where(raw_dx == 1, 1, 0).astype(np.int64)
+
     site_ids = clean_pheno_df["SITE_ID"].astype(str).values
+    unique_sites = sorted(list(set(site_ids)))
+    site_to_idx = {site: idx for idx, site in enumerate(unique_sites)}
+    site_codes = np.array([site_to_idx[s] for s in site_ids], dtype=np.int64)
 
     print(f"SUCCESS: Pipeline prepared {len(labels)} subjects (ASD={np.sum(labels == 1)}, TC={np.sum(labels == 0)}).")
-    return fc_matrices, text_prompts, labels, site_ids, clean_pheno_df
+    return CohortDataBundle(
+        fc_matrices=fc_matrices,
+        text_prompts=text_prompts,
+        labels=labels,
+        site_ids=site_ids,
+        site_codes=site_codes,
+        site_to_idx=site_to_idx,
+        pheno_df=clean_pheno_df,
+    )
