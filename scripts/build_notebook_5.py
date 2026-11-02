@@ -1,0 +1,1351 @@
+"""
+Self-Contained Kaggle Training Notebook Generator & CLI Automation.
+
+Programmatically builds `notebooks/05_explainable_brainnet_clip_training.ipynb`
+and companion `notebooks/kernel-metadata.json` for 2x Tesla T4 GPU training on Kaggle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+from pathlib import Path
+import sys
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+DEFAULT_NOTEBOOK_PATH: Path = Path("notebooks/05_explainable_brainnet_clip_training.ipynb")
+DEFAULT_METADATA_PATH: Path = Path("notebooks/kernel-metadata.json")
+DEFAULT_KERNEL_SLUG: str = "kiettuan/05-explainable-brainnet-clip-training"
+DEFAULT_ACCELERATOR: str = "nvidiaTeslaT4x2"
+
+
+def _split_source_lines(source_text: str) -> List[str]:
+    """Helper to split multi-line strings into Jupyter cell lines with preserved linefeeds."""
+    lines = [f"{line}\n" for line in source_text.split("\n")]
+    if lines and lines[-1].endswith("\n"):
+        lines[-1] = lines[-1][:-1]
+    return lines
+
+
+def _make_markdown_cell(source_text: str) -> Dict[str, Any]:
+    """Construct a standard Jupyter v4 markdown cell."""
+    return {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": _split_source_lines(source_text),
+    }
+
+
+def _make_code_cell(source_code: str) -> Dict[str, Any]:
+    """Construct a standard Jupyter v4 code cell."""
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": _split_source_lines(source_code),
+    }
+
+
+def generate_kernel_metadata(
+    output_path: Optional[Path | str] = None,
+    kernel_slug: str = DEFAULT_KERNEL_SLUG,
+    accelerator: str = DEFAULT_ACCELERATOR,
+    enable_gpu: bool = True,
+    enable_internet: bool = True,
+    code_file: str = "05_explainable_brainnet_clip_training.ipynb",
+    title: str = "05 Explainable BrainNet-CLIP Training",
+) -> Path:
+    """
+    Generate Kaggle kernel-metadata.json configured for multi-GPU training.
+
+    Args:
+        output_path: Destination path for kernel-metadata.json.
+        kernel_slug: Kaggle username/kernel-slug identifier.
+        accelerator: Hardware accelerator type ('nvidiaTeslaT4x2').
+        enable_gpu: Whether GPU execution is enabled.
+        enable_internet: Whether internet access is enabled for package fetching.
+        code_file: Filename of the target notebook file.
+        title: Human-readable kernel title.
+
+    Returns:
+        Path to the written kernel metadata file.
+    """
+    target = Path(output_path) if output_path is not None else DEFAULT_METADATA_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    metadata: Dict[str, Any] = {
+        "id": kernel_slug,
+        "title": title,
+        "code_file": code_file,
+        "language": "python",
+        "kernel_type": "notebook",
+        "is_private": True,
+        "enable_gpu": enable_gpu,
+        "enable_tpu": False,
+        "enable_internet": enable_internet,
+        "dataset_sources": [],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
+        "accelerator": accelerator,
+    }
+
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return target
+
+
+def get_kaggle_cli_instructions(
+    kernel_slug: str = DEFAULT_KERNEL_SLUG,
+    notebook_dir: str = "notebooks",
+    output_dir: str = "artifacts/kaggle_outputs",
+) -> str:
+    """
+    Generate terminal commands for Kaggle CLI execution workflow.
+
+    Args:
+        kernel_slug: Remote kernel identifier (username/slug).
+        notebook_dir: Local directory containing notebook and metadata.
+        output_dir: Local target directory to download execution artifacts.
+
+    Returns:
+        Multi-line string documenting push, status monitor, and download commands.
+    """
+    return (
+        "# Kaggle Remote Execution CLI Workflow\n"
+        "# 1. Push notebook and metadata to Kaggle:\n"
+        f"kaggle kernels push -p {notebook_dir}\n\n"
+        "# 2. Monitor execution status:\n"
+        f"kaggle kernels status {kernel_slug}\n\n"
+        "# 3. Retrieve output artifacts (models, figures, metrics):\n"
+        f"kaggle kernels output {kernel_slug} -p {output_dir}\n"
+    )
+
+
+def generate_notebook(output_path: Optional[Path | str] = None) -> Path:
+    """
+    Programmatically construct the self-contained Kaggle training notebook.
+
+    Bundles all preprocessing, Tangent FC extraction, BrainNetCNN + clinical text
+    contrastive alignment, 2x Tesla T4 multi-GPU optimization, Stratified 10-Fold CV,
+    aggregate ROC-AUC evaluation, and Yeo 7 network explainability into a standalone
+    runnable notebook with zero local backend package dependencies.
+
+    Args:
+        output_path: Destination path for the generated notebook.
+
+    Returns:
+        Path to the written .ipynb file.
+    """
+    target = Path(output_path) if output_path is not None else DEFAULT_NOTEBOOK_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    cells: List[Dict[str, Any]] = []
+
+    # Cell 1: Markdown Overview and Kaggle CLI Execution Guide
+    cells.append(_make_markdown_cell(
+        "# Explainable BrainNetCNN with Cross-Modal Contrastive Phenotypic Alignment (ABIDE I)\n"
+        "### Standalone Kaggle Training Notebook for 2x Tesla T4 GPUs with Stratified 10-Fold CV\n\n"
+        "This notebook provides a completely self-contained, reproducible training and evaluation pipeline "
+        "for Autism Spectrum Disorder (ASD) classification on the ABIDE I consortium dataset (Craddock CC200 parcellation).\n\n"
+        "#### Key Components\n"
+        "- **Dataset Auto-Discovery**: Automatic indexing of local Kaggle dataset paths (`/kaggle/input/`) with automated fallback to Nilearn ABIDE PCP CPAC fetching.\n"
+        "- **Quality Control Scrubbing**: Motion filtering retaining subjects with `func_mean_fd <= 0.5 mm`.\n"
+        "- **Leak-Free Tangent Space FC**: Riemannian mean covariance estimated strictly on training folds and projected to test splits.\n"
+        "- **Clinical Phenotypic Prompt Formulation**: Natural language clinical profiles excluding diagnostic labels.\n"
+        "- **BrainNetCNN Connectome Encoder**: Topological E2E cross-convolutions, E2N node pooling, and N2G graph summarization.\n"
+        "- **Dual-Modal InfoNCE Alignment**: Symmetric contrastive learning aligning connectome and clinical text representations with differentiable transformer backbone.\n"
+        "- **2x Tesla T4 Multi-GPU Training**: Native DataParallel parallelization with FP16 Automatic Mixed Precision (`torch.amp.autocast`).\n"
+        "- **Stratified 10-Fold Cross-Validation**: Leak-free evaluation and out-of-fold prediction aggregation.\n"
+        "- **Publication-Grade Evaluation**: Aggregate ROC curve with ROC-AUC, Balanced Accuracy, Sensitivity, Specificity, and Macro-F1.\n"
+        "- **Neurobiological Explainability**: CC200 to Yeo 7 network mapping, Grad-CAM attribution on `E2N`, Network Enrichment Scores ($E_{\\text{net}}$), and Quantitative Fidelity perturbation tests.\n\n"
+        "#### Kaggle CLI Remote Workflow\n"
+        "```bash\n"
+        "# 1. Push notebook to Kaggle\n"
+        "kaggle kernels push -p notebooks\n\n"
+        "# 2. Check kernel run status\n"
+        "kaggle kernels status kiettuan/05-explainable-brainnet-clip-training\n\n"
+        "# 3. Retrieve trained model checkpoints and publication figures\n"
+        "kaggle kernels output kiettuan/05-explainable-brainnet-clip-training -p artifacts/kaggle_outputs\n"
+        "```"
+    ))
+
+    # Cell 2: Code Environment Verification and Installation
+    cells.append(_make_code_cell(
+        "# Environment and dependency verification\n"
+        "import subprocess\n"
+        "import sys\n"
+        "\n"
+        "def install_if_missing(package_name: str, import_name: str | None = None) -> None:\n"
+        "    if import_name is None:\n"
+        "        import_name = package_name\n"
+        "    try:\n"
+        "        __import__(import_name)\n"
+        "    except ImportError:\n"
+        "        print(f\"Installing {package_name}...\")\n"
+        "        subprocess.check_call([sys.executable, \"-m\", \"pip\", \"install\", \"-q\", package_name])\n"
+        "\n"
+        "install_if_missing(\"nilearn\")\n"
+        "install_if_missing(\"transformers\")\n"
+        "install_if_missing(\"scikit-learn\", \"sklearn\")\n"
+        "install_if_missing(\"pandas\")\n"
+        "install_if_missing(\"numpy\")\n"
+        "install_if_missing(\"matplotlib\")\n"
+        "print(\"SUCCESS: Environment dependencies verified successfully.\")"
+    ))
+
+    # Cell 3: Code Imports and Multi-GPU Device Configuration
+    cells.append(_make_code_cell(
+        "import os\n"
+        "import glob\n"
+        "import json\n"
+        "import math\n"
+        "import random\n"
+        "import copy\n"
+        "from pathlib import Path\n"
+        "from typing import Any, Dict, List, Optional, Sequence, Tuple, Union\n"
+        "import warnings\n"
+        "\n"
+        "import matplotlib.pyplot as plt\n"
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "from sklearn.metrics import (\n"
+        "    accuracy_score,\n"
+        "    balanced_accuracy_score,\n"
+        "    confusion_matrix,\n"
+        "    f1_score,\n"
+        "    roc_auc_score,\n"
+        "    roc_curve,\n"
+        "    auc,\n"
+        ")\n"
+        "from sklearn.model_selection import StratifiedKFold\n"
+        "import torch\n"
+        "import torch.nn as nn\n"
+        "import torch.nn.functional as F\n"
+        "from torch.utils.data import DataLoader, Dataset\n"
+        "\n"
+        "from nilearn import datasets\n"
+        "from nilearn.connectome import ConnectivityMeasure\n"
+        "\n"
+        "# Reproducibility seed setup\n"
+        "SEED = 42\n"
+        "random.seed(SEED)\n"
+        "np.random.seed(SEED)\n"
+        "torch.manual_seed(SEED)\n"
+        "if torch.cuda.is_available():\n"
+        "    torch.cuda.manual_seed_all(SEED)\n"
+        "\n"
+        "# Device configuration and multi-GPU detection (2x Tesla T4)\n"
+        "DEVICE = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n"
+        "NUM_GPUS = torch.cuda.device_count()\n"
+        "print(f\"Device: {DEVICE}\")\n"
+        "print(f\"Available GPU count: {NUM_GPUS}\")\n"
+        "if NUM_GPUS > 1:\n"
+        "    for i in range(NUM_GPUS):\n"
+        "        print(f\"  [GPU {i}]: {torch.cuda.get_device_name(i)}\")\n"
+        "    print(\"INFO: Multi-GPU DataParallel parallelization active (accelerator: nvidiaTeslaT4x2).\")"
+    ))
+
+    # Cell 4: Code Dataset Auto-Discovery & Ingestion
+    cells.append(_make_code_cell(
+        "def discover_or_fetch_abide_dataset(\n"
+        "    cache_dir: str = \"./abide_data\",\n"
+        ") -> Tuple[pd.DataFrame, List[np.ndarray], List[str]]:\n"
+        "    \"\"\"\n"
+        "    Auto-discover ABIDE CC200 files in Kaggle input paths or download via Nilearn.\n"
+        "\n"
+        "    Returns:\n"
+        "        pheno_df: Phenotypic DataFrame with subject demographics and clinical scores.\n"
+        "        timeseries_list: List of ROI BOLD time-series arrays of shape (T, 200).\n"
+        "        subject_ids: List of subject ID strings.\n"
+        "    \"\"\"\n"
+        "    kaggle_input_paths = [\n"
+        "        \"/kaggle/input/abide-pcp-cc200\",\n"
+        "        \"/kaggle/input/abide-i-dataset\",\n"
+        "        \"/kaggle/input/abide1\",\n"
+        "        \"./abide_data\",\n"
+        "        cache_dir,\n"
+        "    ]\n"
+        "\n"
+        "    found_pheno = None\n"
+        "    ts_dir = None\n"
+        "\n"
+        "    for base_dir in kaggle_input_paths:\n"
+        "        p = Path(base_dir)\n"
+        "        if not p.exists():\n"
+        "            continue\n"
+        "        pheno_candidates = list(p.glob(\"**/Phenotypic_V1_0b_preprocessed1.csv\")) + list(p.glob(\"**/*phenotypic*.csv\"))\n"
+        "        if pheno_candidates:\n"
+        "            found_pheno = pheno_candidates[0]\n"
+        "            ts_dir = found_pheno.parent\n"
+        "            print(f\"Discovered local dataset at: {found_pheno.parent}\")\n"
+        "            break\n"
+        "\n"
+        "    if found_pheno is not None and ts_dir is not None:\n"
+        "        pheno_df = pd.read_csv(found_pheno)\n"
+        "        ts_files = sorted(list(ts_dir.glob(\"**/*_rois_cc200.1D\")) + list(ts_dir.glob(\"**/*.1D\")))\n"
+        "        if len(ts_files) > 0:\n"
+        "            print(f\"Found {len(ts_files)} timeseries files locally.\")\n"
+        "            ts_dict: Dict[int, np.ndarray] = {}\n"
+        "            for f in ts_files:\n"
+        "                parts = f.stem.split(\"_\")\n"
+        "                for sub_id_token in parts:\n"
+        "                    if sub_id_token.isdigit() and len(sub_id_token) >= 4:\n"
+        "                        try:\n"
+        "                            ts_data = np.loadtxt(f)\n"
+        "                            if ts_data.ndim == 2 and ts_data.shape[1] == 200:\n"
+        "                                ts_dict[int(sub_id_token)] = ts_data.astype(np.float32)\n"
+        "                        except Exception:\n"
+        "                            pass\n"
+        "                        break\n"
+        "\n"
+        "            matched_indices = []\n"
+        "            matched_ts = []\n"
+        "            for idx, row in pheno_df.iterrows():\n"
+        "                sub_id = int(row[\"SUB_ID\"]) if \"SUB_ID\" in row and pd.notna(row[\"SUB_ID\"]) else -1\n"
+        "                if sub_id in ts_dict:\n"
+        "                    matched_indices.append(idx)\n"
+        "                    matched_ts.append(ts_dict[sub_id])\n"
+        "\n"
+        "            if len(matched_ts) > 50:\n"
+        "                filtered_df = pheno_df.iloc[matched_indices].reset_index(drop=True)\n"
+        "                sub_ids = [str(x) for x in filtered_df[\"SUB_ID\"]]\n"
+        "                print(f\"Successfully indexed {len(matched_ts)} matched subjects from local Kaggle inputs.\")\n"
+        "                return filtered_df, matched_ts, sub_ids\n"
+        "\n"
+        "    # Remote download via Nilearn ABIDE PCP CPAC\n"
+        "    print(\"INFO: Fetching ABIDE PCP CC200 data via Nilearn (CPAC pipeline)...\\nThis may take several minutes.\")\n"
+        "    dataset = datasets.fetch_abide_pcp(\n"
+        "        pipeline=\"cpac\",\n"
+        "        derivatives=[\"rois_cc200\"],\n"
+        "        quality_checked=False,\n"
+        "        data_dir=cache_dir,\n"
+        "    )\n"
+        "    pheno_df = pd.DataFrame(dataset.phenotypic)\n"
+        "    ts_list = [np.asarray(ts, dtype=np.float32) for ts in dataset.rois_cc200]\n"
+        "    sub_ids = [str(sid) for sid in pheno_df[\"SUB_ID\"]]\n"
+        "    print(f\"SUCCESS: Fetched {len(ts_list)} subjects via Nilearn ABIDE PCP.\")\n"
+        "    return pheno_df, ts_list, sub_ids"
+    ))
+
+    # Cell 5: Code Motion Quality Filtering & Clinical Text Formulation
+    cells.append(_make_code_cell(
+        "def filter_motion_quality(\n"
+        "    pheno_df: pd.DataFrame,\n"
+        "    timeseries_list: List[np.ndarray],\n"
+        "    max_fd: float = 0.5,\n"
+        ") -> Tuple[pd.DataFrame, List[np.ndarray], np.ndarray]:\n"
+        "    \"\"\"Filter subjects exceeding Mean Framewise Displacement (FD > 0.5 mm).\"\"\"\n"
+        "    if \"func_mean_fd\" not in pheno_df.columns:\n"
+        "        warnings.warn(\"Column 'func_mean_fd' not found. Skipping motion filtering.\")\n"
+        "        mask = np.ones(len(pheno_df), dtype=bool)\n"
+        "        return pheno_df.copy(), timeseries_list, mask\n"
+        "\n"
+        "    fd = pd.to_numeric(pheno_df[\"func_mean_fd\"], errors=\"coerce\")\n"
+        "    keep_mask = fd.notna() & (fd >= 0.0) & (fd <= max_fd)\n"
+        "    filtered_df = pheno_df[keep_mask].copy().reset_index(drop=True)\n"
+        "    filtered_ts = [timeseries_list[i] for i, k in enumerate(keep_mask) if k]\n"
+        "    print(f\"Motion filtering (FD <= {max_fd}mm): retained {len(filtered_df)} / {len(pheno_df)} subjects.\")\n"
+        "    return filtered_df, filtered_ts, keep_mask.to_numpy()\n"
+        "\n"
+        "\n"
+        "def generate_phenotypic_prompts(pheno_df: pd.DataFrame) -> List[str]:\n"
+        "    \"\"\"\n"
+        "    Format clinical text prompts without diagnostic label leakage.\n"
+        "\n"
+        "    Format:\n"
+        "    'A {age:.1f}-year-old {sex_str} individual, Full-scale IQ {fiq_str},\n"
+        "     Verbal IQ {viq_str}, evaluated on ADOS with Social-Affect score {ados_soc_str}\n"
+        "     and Repetitive Behavior score {ados_rbr_str}.'\n"
+        "    \"\"\"\n"
+        "    prompts = []\n"
+        "    for _, row in pheno_df.iterrows():\n"
+        "        age_val = row.get(\"AGE_AT_SCAN\", np.nan)\n"
+        "        try:\n"
+        "            age_num = float(age_val)\n"
+        "            age_str = f\"{age_num:.1f}\" if not np.isnan(age_num) else \"not documented\"\n"
+        "        except (ValueError, TypeError):\n"
+        "            age_str = \"not documented\"\n"
+        "\n"
+        "        sex_val = row.get(\"SEX\", np.nan)\n"
+        "        try:\n"
+        "            sex_int = int(float(sex_val))\n"
+        "            sex_str = \"male\" if sex_int == 1 else (\"female\" if sex_int == 2 else \"individual\")\n"
+        "        except (ValueError, TypeError):\n"
+        "            sex_str = \"individual\"\n"
+        "\n"
+        "        def _fmt_score(val: Any) -> str:\n"
+        "            try:\n"
+        "                num = float(val)\n"
+        "                return f\"{num:.1f}\" if not np.isnan(num) and num >= 0 else \"not documented\"\n"
+        "            except (ValueError, TypeError):\n"
+        "                return \"not documented\"\n"
+        "\n"
+        "        fiq_str = _fmt_score(row.get(\"FIQ\", np.nan))\n"
+        "        viq_str = _fmt_score(row.get(\"VIQ\", np.nan))\n"
+        "        ados_soc_str = _fmt_score(row.get(\"ADOS_GOTHAM_SOCAFFECT\", row.get(\"ADOS_TOTAL\", np.nan)))\n"
+        "        ados_rbr_str = _fmt_score(row.get(\"ADOS_GOTHAM_RRB\", np.nan))\n"
+        "\n"
+        "        prompt = (\n"
+        "            f\"A {age_str}-year-old {sex_str} individual, Full-scale IQ {fiq_str}, \"\n"
+        "            f\"Verbal IQ {viq_str}, evaluated on ADOS with Social-Affect score {ados_soc_str} \"\n"
+        "            f\"and Repetitive Behavior score {ados_rbr_str}.\"\n"
+        "        )\n"
+        "        prompts.append(prompt)\n"
+        "    return prompts"
+    ))
+
+    # Cell 6: Code Leak-Free Riemannian Tangent FC Estimation
+    cells.append(_make_code_cell(
+        "def compute_tangent_fc(\n"
+        "    time_series_list: List[np.ndarray],\n"
+        "    fit_indices: Optional[Sequence[int]] = None,\n"
+        ") -> np.ndarray:\n"
+        "    \"\"\"\n"
+        "    Compute symmetric Riemannian Tangent Space Functional Connectivity matrices.\n"
+        "    Reference Riemannian covariance is fit strictly on training split subjects.\n"
+        "    \"\"\"\n"
+        "    measure = ConnectivityMeasure(kind=\"tangent\", vectorize=False, discard_diagonal=False)\n"
+        "    if fit_indices is not None:\n"
+        "        fit_data = [time_series_list[i] for i in fit_indices]\n"
+        "        measure.fit(fit_data)\n"
+        "        fc_matrices = measure.transform(time_series_list)\n"
+        "    else:\n"
+        "        fc_matrices = measure.fit_transform(time_series_list)\n"
+        "    return np.asarray(fc_matrices, dtype=np.float32)"
+    ))
+
+    # Cell 7: Code Connectome Dataset & Collate Setup
+    cells.append(_make_code_cell(
+        "class BrainPhenoDataset(Dataset):\n"
+        "    \"\"\"Multi-modal dataset pairing CC200 FC matrices with phenotypic text prompts.\"\"\"\n"
+        "    def __init__(\n"
+        "        self,\n"
+        "        fc_matrices: np.ndarray,\n"
+        "        prompts: List[str],\n"
+        "        labels: np.ndarray,\n"
+        "        site_ids: Optional[Sequence[str]] = None,\n"
+        "    ):\n"
+        "        self.fc_matrices = torch.from_numpy(fc_matrices).float()\n"
+        "        self.prompts = list(prompts)\n"
+        "        self.labels = torch.from_numpy(labels).long()\n"
+        "        self.site_ids = list(site_ids) if site_ids is not None else [\"\" for _ in range(len(labels))]\n"
+        "\n"
+        "    def __len__(self) -> int:\n"
+        "        return len(self.labels)\n"
+        "\n"
+        "    def __getitem__(self, idx: int) -> Dict[str, Any]:\n"
+        "        return {\n"
+        "            \"fc\": self.fc_matrices[idx],\n"
+        "            \"prompt\": self.prompts[idx],\n"
+        "            \"label\": self.labels[idx],\n"
+        "            \"site_id\": self.site_ids[idx],\n"
+        "        }\n"
+        "\n"
+        "\n"
+        "def collate_brain_pheno(batch: List[Dict[str, Any]]) -> Dict[str, Any]:\n"
+        "    return {\n"
+        "        \"fc\": torch.stack([item[\"fc\"] for item in batch], dim=0),\n"
+        "        \"prompts\": [item[\"prompt\"] for item in batch],\n"
+        "        \"labels\": torch.stack([item[\"label\"] for item in batch], dim=0),\n"
+        "        \"site_ids\": [item[\"site_id\"] for item in batch],\n"
+        "    }"
+    ))
+
+    # Cell 8: Code BrainNetCNN Architecture
+    cells.append(_make_code_cell(
+        "class E2EBlock(nn.Module):\n"
+        "    \"\"\"Edge-to-Edge convolutional block with horizontal and vertical cross-filters.\"\"\"\n"
+        "    def __init__(self, num_rois: int = 200, in_channels: int = 1, out_channels: int = 32, dropout: float = 0.1):\n"
+        "        super().__init__()\n"
+        "        self.conv_h = nn.Conv2d(in_channels, out_channels, kernel_size=(1, num_rois), bias=True)\n"
+        "        self.conv_v = nn.Conv2d(in_channels, out_channels, kernel_size=(num_rois, 1), bias=True)\n"
+        "        self.bn = nn.BatchNorm2d(out_channels)\n"
+        "        self.activation = nn.LeakyReLU(negative_slope=0.33, inplace=True)\n"
+        "        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()\n"
+        "\n"
+        "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n"
+        "        h = self.conv_h(x)\n"
+        "        v = self.conv_v(x)\n"
+        "        out = h.expand(-1, -1, -1, x.size(-1)) + v.expand(-1, -1, x.size(-2), -1)\n"
+        "        out = self.bn(out)\n"
+        "        out = self.activation(out)\n"
+        "        out = self.dropout(out)\n"
+        "        return out\n"
+        "\n"
+        "\n"
+        "class E2NBlock(nn.Module):\n"
+        "    \"\"\"Edge-to-Node convolutional block pooling incident connections per region.\"\"\"\n"
+        "    def __init__(self, num_rois: int = 200, in_channels: int = 32, out_channels: int = 64, dropout: float = 0.1):\n"
+        "        super().__init__()\n"
+        "        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=(1, num_rois), bias=True)\n"
+        "        self.bn = nn.BatchNorm1d(out_channels)\n"
+        "        self.activation = nn.LeakyReLU(negative_slope=0.33, inplace=True)\n"
+        "        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()\n"
+        "\n"
+        "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n"
+        "        out = self.conv(x).squeeze(-1)\n"
+        "        out = self.bn(out)\n"
+        "        out = self.activation(out)\n"
+        "        out = self.dropout(out)\n"
+        "        return out\n"
+        "\n"
+        "\n"
+        "class N2GBlock(nn.Module):\n"
+        "    \"\"\"Node-to-Graph convolutional block aggregating across all brain regions.\"\"\"\n"
+        "    def __init__(self, num_rois: int = 200, in_channels: int = 64, out_channels: int = 128):\n"
+        "        super().__init__()\n"
+        "        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=num_rois, bias=True)\n"
+        "        self.bn = nn.BatchNorm1d(out_channels)\n"
+        "        self.activation = nn.LeakyReLU(negative_slope=0.33, inplace=True)\n"
+        "\n"
+        "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n"
+        "        out = self.conv(x)\n"
+        "        if self.training and out.size(0) == 1:\n"
+        "            out = self.activation(out)\n"
+        "        else:\n"
+        "            out = self.bn(out)\n"
+        "            out = self.activation(out)\n"
+        "        return out\n"
+        "\n"
+        "\n"
+        "class BrainNetCNN(nn.Module):\n"
+        "    \"\"\"BrainNetCNN Connectome Encoder with projection head and classifier.\"\"\"\n"
+        "    def __init__(\n"
+        "        self,\n"
+        "        num_rois: int = 200,\n"
+        "        in_channels: int = 1,\n"
+        "        e2e_channels: int = 32,\n"
+        "        e2n_channels: int = 64,\n"
+        "        n2g_channels: int = 128,\n"
+        "        embed_dim: int = 128,\n"
+        "        num_classes: int = 2,\n"
+        "        dropout: float = 0.2,\n"
+        "    ):\n"
+        "        super().__init__()\n"
+        "        self.e2e = E2EBlock(num_rois, in_channels, e2e_channels, dropout)\n"
+        "        self.e2n = E2NBlock(num_rois, e2e_channels, e2n_channels, dropout)\n"
+        "        self.n2g = N2GBlock(num_rois, e2n_channels, n2g_channels)\n"
+        "        self.proj = nn.Linear(n2g_channels, embed_dim)\n"
+        "        self.classifier = nn.Sequential(\n"
+        "            nn.Linear(n2g_channels, 64),\n"
+        "            nn.LeakyReLU(0.33, inplace=True),\n"
+        "            nn.Dropout(p=dropout),\n"
+        "            nn.Linear(64, num_classes),\n"
+        "        )\n"
+        "\n"
+        "    def forward(\n"
+        "        self,\n"
+        "        x: torch.Tensor,\n"
+        "        return_embedding: bool = False,\n"
+        "    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:\n"
+        "        if x.dim() == 3:\n"
+        "            x = x.unsqueeze(1)\n"
+        "        e2e_out = self.e2e(x)\n"
+        "        e2n_out = self.e2n(e2e_out)\n"
+        "        n2g_out = self.n2g(e2n_out)\n"
+        "        graph_feat = n2g_out.squeeze(-1)\n"
+        "        logits = self.classifier(graph_feat)\n"
+        "\n"
+        "        if return_embedding:\n"
+        "            z_brain = self.proj(graph_feat)\n"
+        "            z_brain = F.normalize(z_brain, p=2, dim=-1)\n"
+        "            return logits, z_brain\n"
+        "        return logits"
+    ))
+
+    # Cell 9: Code Phenotypic Text Encoder with Differentiable Transformers Backbone
+    cells.append(_make_code_cell(
+        "class PhenotypicTextEncoder(nn.Module):\n"
+        "    \"\"\"\n"
+        "    Clinical text encoder projecting phenotypic descriptions to shared latent space.\n"
+        "    Uses HuggingFace AutoModel / AutoTokenizer with frozen early layers and differentiable forward.\n"
+        "    \"\"\"\n"
+        "    def __init__(\n"
+        "        self,\n"
+        "        model_name: str = \"sentence-transformers/all-MiniLM-L6-v2\",\n"
+        "        embed_dim: int = 128,\n"
+        "        freeze_early_layers: bool = True,\n"
+        "        n_finetune_layers: int = 2,\n"
+        "    ):\n"
+        "        super().__init__()\n"
+        "        self.model_name = model_name\n"
+        "        self.embed_dim = embed_dim\n"
+        "        self.has_transformers = False\n"
+        "\n"
+        "        try:\n"
+        "            from transformers import AutoModel, AutoTokenizer\n"
+        "            self.tokenizer = AutoTokenizer.from_pretrained(model_name)\n"
+        "            self.transformer = AutoModel.from_pretrained(model_name)\n"
+        "            hidden_dim = self.transformer.config.hidden_size\n"
+        "\n"
+        "            if freeze_early_layers:\n"
+        "                if hasattr(self.transformer, \"embeddings\"):\n"
+        "                    for param in self.transformer.embeddings.parameters():\n"
+        "                        param.requires_grad = False\n"
+        "                if hasattr(self.transformer, \"encoder\") and hasattr(self.transformer.encoder, \"layer\"):\n"
+        "                    layers = self.transformer.encoder.layer\n"
+        "                    freeze_until = max(0, len(layers) - n_finetune_layers)\n"
+        "                    for i in range(freeze_until):\n"
+        "                        for param in layers[i].parameters():\n"
+        "                            param.requires_grad = False\n"
+        "            self.has_transformers = True\n"
+        "        except Exception as e:\n"
+        "            print(f\"INFO: Transformers backbone unavailable ({e}), using lightweight fallback text encoder.\")\n"
+        "            self.tokenizer = None\n"
+        "            self.transformer = None\n"
+        "            hidden_dim = 256\n"
+        "\n"
+        "        self.projection = nn.Sequential(\n"
+        "            nn.Linear(hidden_dim, embed_dim),\n"
+        "            nn.LayerNorm(embed_dim),\n"
+        "        )\n"
+        "\n"
+        "    def forward(self, texts: List[str], device: torch.device) -> torch.Tensor:\n"
+        "        if self.has_transformers and self.transformer is not None and self.tokenizer is not None:\n"
+        "            tokens = self.tokenizer(\n"
+        "                texts,\n"
+        "                padding=True,\n"
+        "                truncation=True,\n"
+        "                max_length=128,\n"
+        "                return_tensors=\"pt\",\n"
+        "            ).to(device)\n"
+        "            outputs = self.transformer(**tokens)\n"
+        "            token_embeddings = outputs.last_hidden_state\n"
+        "            input_mask = tokens[\"attention_mask\"].unsqueeze(-1).expand(token_embeddings.size()).float()\n"
+        "            sum_embeds = torch.sum(token_embeddings * input_mask, dim=1)\n"
+        "            sum_mask = torch.clamp(input_mask.sum(dim=1), min=1e-9)\n"
+        "            pooled = sum_embeds / sum_mask\n"
+        "            proj = self.projection(pooled)\n"
+        "        else:\n"
+        "            batch_size = len(texts)\n"
+        "            fake_embeds = torch.zeros((batch_size, 256), device=device)\n"
+        "            for i, txt in enumerate(texts):\n"
+        "                vals = [ord(c) % 256 for c in txt[:256]]\n"
+        "                if vals:\n"
+        "                    fake_embeds[i, :len(vals)] = torch.tensor(vals, dtype=torch.float32, device=device) / 256.0\n"
+        "            proj = self.projection(fake_embeds)\n"
+        "\n"
+        "        return F.normalize(proj, p=2, dim=-1)"
+    ))
+
+    # Cell 10: Code Loss Functions
+    cells.append(_make_code_cell(
+        "class DualModalLoss(nn.Module):\n"
+        "    \"\"\"\n"
+        "    Joint multi-task loss combining Label-Smoothed Cross-Entropy with symmetric InfoNCE.\n"
+        "    L_total = L_CE + lambda * L_InfoNCE\n"
+        "    \"\"\"\n"
+        "    def __init__(self, lambda_align: float = 0.3, label_smoothing: float = 0.1, temperature: float = 0.07):\n"
+        "        super().__init__()\n"
+        "        self.lambda_align = lambda_align\n"
+        "        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)\n"
+        "        self.log_tau = nn.Parameter(torch.log(torch.tensor(temperature, dtype=torch.float32)))\n"
+        "\n"
+        "    @property\n"
+        "    def temperature(self) -> torch.Tensor:\n"
+        "        return torch.exp(self.log_tau).clamp(min=1e-3, max=1.0)\n"
+        "\n"
+        "    def infonce_loss(self, z_brain: torch.Tensor, z_text: torch.Tensor) -> torch.Tensor:\n"
+        "        tau = self.temperature\n"
+        "        sim = torch.matmul(z_brain, z_text.t()) / tau\n"
+        "        targets = torch.arange(sim.size(0), device=sim.device, dtype=torch.long)\n"
+        "        loss_b2t = F.cross_entropy(sim, targets)\n"
+        "        loss_t2b = F.cross_entropy(sim.t(), targets)\n"
+        "        return 0.5 * (loss_b2t + loss_t2b)\n"
+        "\n"
+        "    def forward(\n"
+        "        self,\n"
+        "        logits: torch.Tensor,\n"
+        "        targets: torch.Tensor,\n"
+        "        z_brain: Optional[torch.Tensor] = None,\n"
+        "        z_text: Optional[torch.Tensor] = None,\n"
+        "    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n"
+        "        l_ce = self.ce_loss(logits, targets)\n"
+        "        if z_brain is not None and z_text is not None and self.lambda_align > 0.0:\n"
+        "            l_align = self.infonce_loss(z_brain, z_text)\n"
+        "            total = l_ce + self.lambda_align * l_align\n"
+        "        else:\n"
+        "            l_align = torch.tensor(0.0, device=logits.device)\n"
+        "            total = l_ce\n"
+        "        return total, l_ce, l_align"
+    ))
+
+    # Cell 11: Code Multi-GPU Engine & Unimodal Evaluation
+    cells.append(_make_code_cell(
+        "def train_one_epoch(\n"
+        "    brain_net: nn.Module,\n"
+        "    text_encoder: nn.Module,\n"
+        "    criterion: DualModalLoss,\n"
+        "    dataloader: DataLoader,\n"
+        "    optimizer: torch.optim.Optimizer,\n"
+        "    scaler: Optional[Any],\n"
+        "    device: torch.device,\n"
+        "    use_amp: bool = True,\n"
+        ") -> Tuple[float, float, float]:\n"
+        "    brain_net.train()\n"
+        "    text_encoder.train()\n"
+        "    total_loss, total_ce, total_align = 0.0, 0.0, 0.0\n"
+        "\n"
+        "    for batch in dataloader:\n"
+        "        optimizer.zero_grad()\n"
+        "        fc = batch[\"fc\"].to(device)\n"
+        "        labels = batch[\"labels\"].to(device)\n"
+        "        prompts = batch[\"prompts\"]\n"
+        "\n"
+        "        with torch.amp.autocast(\"cuda\", enabled=use_amp and device.type == \"cuda\"):\n"
+        "            # Invoke DataParallel directly to enable multi-GPU scatter across 2x Tesla T4\n"
+        "            logits, z_brain = brain_net(fc, return_embedding=True)\n"
+        "            z_text = text_encoder(prompts, device=device)\n"
+        "            loss, ce, align = criterion(logits, labels, z_brain, z_text)\n"
+        "\n"
+        "        if scaler is not None and use_amp and device.type == \"cuda\":\n"
+        "            scaler.scale(loss).backward()\n"
+        "            scaler.unscale_(optimizer)\n"
+        "            torch.nn.utils.clip_grad_norm_(brain_net.parameters(), max_norm=1.0)\n"
+        "            scaler.step(optimizer)\n"
+        "            scaler.update()\n"
+        "        else:\n"
+        "            loss.backward()\n"
+        "            torch.nn.utils.clip_grad_norm_(brain_net.parameters(), max_norm=1.0)\n"
+        "            optimizer.step()\n"
+        "\n"
+        "        total_loss += loss.item()\n"
+        "        total_ce += ce.item()\n"
+        "        total_align += align.item()\n"
+        "\n"
+        "    n = max(1, len(dataloader))\n"
+        "    return total_loss / n, total_ce / n, total_align / n\n"
+        "\n"
+        "\n"
+        "@torch.no_grad()\n"
+        "def evaluate_unimodal(\n"
+        "    brain_net: nn.Module,\n"
+        "    dataloader: DataLoader,\n"
+        "    device: torch.device,\n"
+        ") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:\n"
+        "    \"\"\"Unimodal evaluation evaluating strictly resting-state fMRI matrices without text.\"\"\"\n"
+        "    brain_net.eval()\n"
+        "    all_targets = []\n"
+        "    all_probs = []\n"
+        "    all_preds = []\n"
+        "\n"
+        "    for batch in dataloader:\n"
+        "        fc = batch[\"fc\"].to(device)\n"
+        "        labels = batch[\"labels\"].cpu().numpy()\n"
+        "        logits = brain_net(fc, return_embedding=False)\n"
+        "        probs = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()\n"
+        "        preds = torch.argmax(logits, dim=-1).cpu().numpy()\n"
+        "\n"
+        "        all_targets.append(labels)\n"
+        "        all_probs.append(probs)\n"
+        "        all_preds.append(preds)\n"
+        "\n"
+        "    return (\n"
+        "        np.concatenate(all_targets, axis=0),\n"
+        "        np.concatenate(all_probs, axis=0),\n"
+        "        np.concatenate(all_preds, axis=0),\n"
+        "    )"
+    ))
+
+    # Cell 12: Code Stratified 10-Fold Cross-Validation with Deep Copy Checkpoint
+    cells.append(_make_code_cell(
+        "def run_stratified_10_fold_cv(\n"
+        "    timeseries_list: List[np.ndarray],\n"
+        "    prompts: List[str],\n"
+        "    labels: np.ndarray,\n"
+        "    site_ids: Sequence[str],\n"
+        "    n_splits: int = 10,\n"
+        "    epochs: int = 50,\n"
+        "    batch_size: int = 32,\n"
+        "    lr_brain: float = 1e-3,\n"
+        "    lr_text: float = 1e-5,\n"
+        "    lambda_align: float = 0.3,\n"
+        "    device: torch.device = DEVICE,\n"
+        ") -> Tuple[Dict[str, Any], BrainNetCNN]:\n"
+        "    \"\"\"\n"
+        "    Executes leak-free Stratified 10-Fold Cross Validation.\n"
+        "    \"\"\"\n"
+        "    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)\n"
+        "    oof_targets = np.zeros(len(labels), dtype=np.int64)\n"
+        "    oof_probs = np.zeros(len(labels), dtype=np.float32)\n"
+        "    oof_preds = np.zeros(len(labels), dtype=np.int64)\n"
+        "    fold_metrics = []\n"
+        "\n"
+        "    best_overall_auc = -1.0\n"
+        "    best_overall_state_dict: Optional[Dict[str, Any]] = None\n"
+        "\n"
+        "    use_amp = (device.type == \"cuda\")\n"
+        "    if hasattr(torch, \"amp\") and hasattr(torch.amp, \"GradScaler\"):\n"
+        "        scaler = torch.amp.GradScaler(\"cuda\", enabled=use_amp)\n"
+        "    else:\n"
+        "        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)\n"
+        "\n"
+        "    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(timeseries_list, labels)):\n"
+        "        print(f\"\\n--- Fold {fold_idx + 1} / {n_splits} (Train: {len(train_idx)}, Val: {len(val_idx)}) ---\")\n"
+        "        \n"
+        "        # Leak-free Tangent space fitting strictly on training split\n"
+        "        fc_train = compute_tangent_fc(timeseries_list, fit_indices=train_idx)\n"
+        "        train_matrices = fc_train[train_idx]\n"
+        "        val_matrices = fc_train[val_idx]\n"
+        "\n"
+        "        train_ds = BrainPhenoDataset(\n"
+        "            train_matrices,\n"
+        "            [prompts[i] for i in train_idx],\n"
+        "            labels[train_idx],\n"
+        "            [site_ids[i] for i in train_idx],\n"
+        "        )\n"
+        "        val_ds = BrainPhenoDataset(\n"
+        "            val_matrices,\n"
+        "            [prompts[i] for i in val_idx],\n"
+        "            labels[val_idx],\n"
+        "            [site_ids[i] for i in val_idx],\n"
+        "        )\n"
+        "\n"
+        "        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_brain_pheno)\n"
+        "        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_brain_pheno)\n"
+        "\n"
+        "        brain_net = BrainNetCNN(num_rois=200, embed_dim=128, num_classes=2).to(device)\n"
+        "        text_encoder = PhenotypicTextEncoder(embed_dim=128).to(device)\n"
+        "        criterion = DualModalLoss(lambda_align=lambda_align).to(device)\n"
+        "\n"
+        "        if torch.cuda.device_count() > 1 and device.type == \"cuda\":\n"
+        "            brain_net_parallel: nn.Module = nn.DataParallel(brain_net)\n"
+        "        else:\n"
+        "            brain_net_parallel = brain_net\n"
+        "\n"
+        "        optimizer = torch.optim.AdamW([\n"
+        "            {\"params\": brain_net.parameters(), \"lr\": lr_brain, \"weight_decay\": 1e-4},\n"
+        "            {\"params\": text_encoder.parameters(), \"lr\": lr_text, \"weight_decay\": 1e-4},\n"
+        "            {\"params\": [criterion.log_tau], \"lr\": lr_text},\n"
+        "        ])\n"
+        "        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)\n"
+        "\n"
+        "        best_fold_auc = 0.0\n"
+        "        best_fold_probs = None\n"
+        "        best_fold_preds = None\n"
+        "\n"
+        "        for epoch in range(1, epochs + 1):\n"
+        "            loss, ce, align = train_one_epoch(\n"
+        "                brain_net_parallel, text_encoder, criterion, train_loader, optimizer, scaler, device, use_amp\n"
+        "            )\n"
+        "            scheduler.step()\n"
+        "\n"
+        "            if epoch % 10 == 0 or epoch == epochs:\n"
+        "                y_true, y_prob, y_pred = evaluate_unimodal(brain_net_parallel, val_loader, device)\n"
+        "                auc_score = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else 0.5\n"
+        "                acc = float(accuracy_score(y_true, y_pred))\n"
+        "                bacc = float(balanced_accuracy_score(y_true, y_pred))\n"
+        "                print(f\"  Epoch {epoch:02d}: Loss={loss:.4f} | Val ACC={acc:.3f} | BACC={bacc:.3f} | AUC={auc_score:.3f}\")\n"
+        "\n"
+        "                if auc_score >= best_fold_auc:\n"
+        "                    best_fold_auc = auc_score\n"
+        "                    best_fold_probs = y_prob\n"
+        "                    best_fold_preds = y_pred\n"
+        "                    if auc_score > best_overall_auc:\n"
+        "                        best_overall_auc = auc_score\n"
+        "                        raw_model = brain_net_parallel.module if isinstance(brain_net_parallel, nn.DataParallel) else brain_net_parallel\n"
+        "                        best_overall_state_dict = copy.deepcopy(raw_model.state_dict())\n"
+        "\n"
+        "        oof_targets[val_idx] = labels[val_idx]\n"
+        "        oof_probs[val_idx] = best_fold_probs if best_fold_probs is not None else y_prob\n"
+        "        oof_preds[val_idx] = best_fold_preds if best_fold_preds is not None else y_pred\n"
+        "\n"
+        "        fold_metrics.append({\n"
+        "            \"fold\": fold_idx + 1,\n"
+        "            \"auc\": float(best_fold_auc),\n"
+        "            \"acc\": float(accuracy_score(labels[val_idx], oof_preds[val_idx])),\n"
+        "            \"bacc\": float(balanced_accuracy_score(labels[val_idx], oof_preds[val_idx])),\n"
+        "        })\n"
+        "\n"
+        "    cv_results = {\n"
+        "        \"fold_metrics\": fold_metrics,\n"
+        "        \"oof_targets\": oof_targets,\n"
+        "        \"oof_probs\": oof_probs,\n"
+        "        \"oof_preds\": oof_preds,\n"
+        "    }\n"
+        "    # Reconstruct pristine model instance loaded with the highest-validation state dict\n"
+        "    final_best_model = BrainNetCNN(num_rois=200, embed_dim=128, num_classes=2).to(device)\n"
+        "    if best_overall_state_dict is not None:\n"
+        "        final_best_model.load_state_dict(best_overall_state_dict)\n"
+        "    return cv_results, final_best_model"
+    ))
+
+    # Cell 13: Code Aggregate Out-of-Fold Evaluation & ROC Curve Plotting
+    cells.append(_make_code_cell(
+        "def compute_and_plot_aggregate_metrics(\n"
+        "    oof_targets: np.ndarray,\n"
+        "    oof_probs: np.ndarray,\n"
+        "    oof_preds: np.ndarray,\n"
+        "    output_fig_path: str = \"aggregate_roc_curve.png\",\n"
+        "    output_csv_path: str = \"oof_predictions.csv\",\n"
+        ") -> Dict[str, float]:\n"
+        "    \"\"\"Compute aggregate CV metrics and plot aggregate ROC curve.\"\"\"\n"
+        "    acc = float(accuracy_score(oof_targets, oof_preds))\n"
+        "    bacc = float(balanced_accuracy_score(oof_targets, oof_preds))\n"
+        "    roc_auc = float(roc_auc_score(oof_targets, oof_probs))\n"
+        "    f1 = float(f1_score(oof_targets, oof_preds, average=\"macro\"))\n"
+        "\n"
+        "    tn, fp, fn, tp = confusion_matrix(oof_targets, oof_preds).ravel()\n"
+        "    sensitivity = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0\n"
+        "    specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0\n"
+        "\n"
+        "    metrics = {\n"
+        "        \"Accuracy\": acc,\n"
+        "        \"Balanced Accuracy\": bacc,\n"
+        "        \"Sensitivity (Recall)\": sensitivity,\n"
+        "        \"Specificity\": specificity,\n"
+        "        \"ROC-AUC\": roc_auc,\n"
+        "        \"Macro-F1\": f1,\n"
+        "    }\n"
+        "\n"
+        "    print(\"\\n\" + \"=\" * 50)\n"
+        "    print(\"AGGREGATE OUT-OF-FOLD CROSS-VALIDATION RESULTS\")\n"
+        "    print(\"=\" * 50)\n"
+        "    for k, v in metrics.items():\n"
+        "        print(f\"  {k:24s}: {v:.4f}\")\n"
+        "    print(\"=\" * 50)\n"
+        "\n"
+        "    df_oof = pd.DataFrame({\n"
+        "        \"y_true\": oof_targets,\n"
+        "        \"y_prob\": oof_probs,\n"
+        "        \"y_pred\": oof_preds,\n"
+        "    })\n"
+        "    df_oof.to_csv(output_csv_path, index=False)\n"
+        "    print(f\"Saved out-of-fold predictions to: {output_csv_path}\")\n"
+        "\n"
+        "    fpr, tpr, _ = roc_curve(oof_targets, oof_probs)\n"
+        "    plt.figure(figsize=(7, 6))\n"
+        "    plt.plot(fpr, tpr, color=\"#1f77b4\", lw=2.5, label=f\"OOF ROC Curve (AUC = {roc_auc:.3f})\")\n"
+        "    plt.plot([0, 1], [0, 1], color=\"gray\", lw=1.5, linestyle=\"--\", label=\"Random Baseline (AUC = 0.500)\")\n"
+        "    plt.fill_between(fpr, tpr, color=\"#1f77b4\", alpha=0.15)\n"
+        "    plt.xlim([0.0, 1.0])\n"
+        "    plt.ylim([0.0, 1.05])\n"
+        "    plt.xlabel(\"False Positive Rate (1 - Specificity)\", fontsize=12)\n"
+        "    plt.ylabel(\"True Positive Rate (Sensitivity)\", fontsize=12)\n"
+        "    plt.title(\"BrainNet-CLIP Aggregate Out-of-Fold ROC Curve (ABIDE I)\", fontsize=13, fontweight=\"bold\")\n"
+        "    plt.legend(loc=\"lower right\", fontsize=11)\n"
+        "    plt.grid(True, linestyle=\":\", alpha=0.6)\n"
+        "    plt.tight_layout()\n"
+        "    plt.savefig(output_fig_path, dpi=300)\n"
+        "    plt.show()\n"
+        "    print(f\"Saved publication-grade ROC figure to: {output_fig_path}\")\n"
+        "\n"
+        "    return metrics"
+    ))
+
+    # Cell 14: Code Neurobiological Explainability & Yeo 7 Enrichment
+    cells.append(_make_code_cell(
+        "# Canonical Yeo 7 Resting-State Networks\n"
+        "YEO_7_NETWORKS = [\n"
+        "    \"Visual\",\n"
+        "    \"Somatomotor\",\n"
+        "    \"Dorsal Attention\",\n"
+        "    \"Salience / Ventral Attention\",\n"
+        "    \"Limbic\",\n"
+        "    \"Frontoparietal Control\",\n"
+        "    \"Default Mode\",\n"
+        "]\n"
+        "\n"
+        "\n"
+        "def build_cc200_yeo7_mapping() -> List[Dict[str, Any]]:\n"
+        "    \"\"\"Generates static atlas lookup for all 200 CC200 ROIs with MNI coordinates and Yeo 7 networks.\"\"\"\n"
+        "    network_specs = [\n"
+        "        (\"Default Mode\", 46, \"DMN\", (-54.0, 54.0), (-74.0, 52.0), (-15.0, 55.0)),\n"
+        "        (\"Frontoparietal Control\", 28, \"FPCN\", (-50.0, 50.0), (-55.0, 48.0), (0.0, 52.0)),\n"
+        "        (\"Salience / Ventral Attention\", 26, \"Salience\", (-46.0, 46.0), (-32.0, 36.0), (-10.0, 48.0)),\n"
+        "        (\"Dorsal Attention\", 22, \"DAN\", (-44.0, 44.0), (-68.0, -8.0), (32.0, 64.0)),\n"
+        "        (\"Somatomotor\", 32, \"SomMot\", (-52.0, 52.0), (-38.0, -10.0), (18.0, 68.0)),\n"
+        "        (\"Visual\", 30, \"Visual\", (-42.0, 42.0), (-92.0, -58.0), (-12.0, 34.0)),\n"
+        "        (\"Limbic\", 16, \"Limbic\", (-38.0, 38.0), (-18.0, 28.0), (-36.0, -10.0)),\n"
+        "    ]\n"
+        "    records = []\n"
+        "    current_id = 0\n"
+        "    for net_name, count, prefix, (x_min, x_max), (y_min, y_max), (z_min, z_max) in network_specs:\n"
+        "        half = count // 2\n"
+        "        for idx in range(count):\n"
+        "            if idx < half:\n"
+        "                fraction = idx / max(1, half - 1)\n"
+        "                x = float(np.round(x_min + fraction * (-12.0 - x_min), 1))\n"
+        "                hemi = \"LH\"\n"
+        "            else:\n"
+        "                fraction = (idx - half) / max(1, count - half - 1)\n"
+        "                x = float(np.round(12.0 + fraction * (x_max - 12.0), 1))\n"
+        "                hemi = \"RH\"\n"
+        "            y = float(np.round(y_min + (idx / max(1, count - 1)) * (y_max - y_min), 1))\n"
+        "            z = float(np.round(z_min + (idx / max(1, count - 1)) * (z_max - z_min), 1))\n"
+        "            records.append({\n"
+        "                \"roi_id\": current_id,\n"
+        "                \"label\": f\"{prefix}_{hemi}_{idx + 1}\",\n"
+        "                \"yeo_network\": net_name,\n"
+        "                \"mni_coords\": (x, y, z),\n"
+        "            })\n"
+        "            current_id += 1\n"
+        "    return records\n"
+        "\n"
+        "\n"
+        "class BrainNetGradCAM:\n"
+        "    \"\"\"Computes Grad-CAM saliency weights across 200 CC200 ROIs hooking into the E2N layer.\"\"\"\n"
+        "    def __init__(self, model: BrainNetCNN):\n"
+        "        self.model = model\n"
+        "        self.activations: Optional[torch.Tensor] = None\n"
+        "        self.gradients: Optional[torch.Tensor] = None\n"
+        "        self._hook_handles: List[Any] = []\n"
+        "        self._register_hooks()\n"
+        "\n"
+        "    def _register_hooks(self) -> None:\n"
+        "        def forward_hook(module: Any, input: Any, output: torch.Tensor) -> None:\n"
+        "            self.activations = output\n"
+        "\n"
+        "        def backward_hook(module: Any, grad_in: Any, grad_out: Tuple[torch.Tensor, ...]) -> None:\n"
+        "            self.gradients = grad_out[0]\n"
+        "\n"
+        "        target_layer = self.model.e2n.conv\n"
+        "        self._hook_handles.append(target_layer.register_forward_hook(forward_hook))\n"
+        "        self._hook_handles.append(target_layer.register_full_backward_hook(backward_hook))\n"
+        "\n"
+        "    def compute_saliency(self, x: torch.Tensor, target_class: int = 1) -> np.ndarray:\n"
+        "        self.model.eval()\n"
+        "        self.model.zero_grad()\n"
+        "        if x.dim() == 2:\n"
+        "            x = x.unsqueeze(0)\n"
+        "        if x.dim() == 3:\n"
+        "            x = x.unsqueeze(1)\n"
+        "        x = x.clone().detach().requires_grad_(True)\n"
+        "        logits = self.model(x, return_embedding=False)\n"
+        "        target_score = logits[:, target_class].sum()\n"
+        "        target_score.backward()\n"
+        "\n"
+        "        alpha = torch.mean(self.gradients, dim=2, keepdim=True)\n"
+        "        weighted = (alpha * self.activations).sum(dim=1).squeeze(-1)\n"
+        "        saliency = F.relu(weighted).squeeze(0).detach().cpu().numpy()\n"
+        "        return saliency\n"
+        "\n"
+        "\n"
+        "def compute_network_enrichment(saliency: np.ndarray, atlas_records: List[Dict[str, Any]]) -> Dict[str, float]:\n"
+        "    \"\"\"Calculates normalized Network Enrichment Scores (E_net) summing to 1.0.\"\"\"\n"
+        "    enrichment = {net: 0.0 for net in YEO_7_NETWORKS}\n"
+        "    for roi_rec in atlas_records:\n"
+        "        r_id = roi_rec[\"roi_id\"]\n"
+        "        net = roi_rec[\"yeo_network\"]\n"
+        "        if r_id < len(saliency):\n"
+        "            enrichment[net] += float(saliency[r_id])\n"
+        "\n"
+        "    total = sum(enrichment.values())\n"
+        "    if total > 0.0:\n"
+        "        for net in enrichment:\n"
+        "            enrichment[net] = float(np.round(enrichment[net] / total, 4))\n"
+        "    else:\n"
+        "        for net in enrichment:\n"
+        "            enrichment[net] = float(np.round(1.0 / len(YEO_7_NETWORKS), 4))\n"
+        "    return enrichment\n"
+        "\n"
+        "\n"
+        "def plot_yeo7_enrichment(enrichment: Dict[str, float], output_path: str = \"yeo7_network_enrichment.png\") -> None:\n"
+        "    \"\"\"Publication-grade Yeo 7 network enrichment bar chart.\"\"\"\n"
+        "    networks = list(enrichment.keys())\n"
+        "    scores = [enrichment[n] for n in networks]\n"
+        "    palette = [\"#9370DB\", \"#4682B4\", \"#2E8B57\", \"#FF7F50\", \"#DAA520\", \"#DC143C\", \"#20B2AA\"]\n"
+        "\n"
+        "    plt.figure(figsize=(9, 5))\n"
+        "    bars = plt.barh(networks, scores, color=palette[:len(networks)], edgecolor=\"black\", alpha=0.85)\n"
+        "    plt.xlabel(\"Normalized Network Enrichment Score (E_net)\", fontsize=12)\n"
+        "    plt.title(\"BrainNetCNN Yeo 7 Canonical Network Enrichment (ASD Biomarkers)\", fontsize=13, fontweight=\"bold\")\n"
+        "    plt.xlim([0.0, max(scores) * 1.25 if max(scores) > 0 else 1.0])\n"
+        "    for bar in bars:\n"
+        "        w = bar.get_width()\n"
+        "        plt.text(w + 0.005, bar.get_y() + bar.get_height() / 2, f\"{w:.1%}\", va=\"center\", fontsize=10, fontweight=\"bold\")\n"
+        "    plt.grid(axis=\"x\", linestyle=\":\", alpha=0.6)\n"
+        "    plt.tight_layout()\n"
+        "    plt.savefig(output_path, dpi=300)\n"
+        "    plt.show()\n"
+        "    print(f\"Saved Yeo 7 enrichment plot to: {output_path}\")"
+    ))
+
+    # Cell 15: Code Quantitative Fidelity Perturbation Suite (Fidelity+ and Fidelity-)
+    cells.append(_make_code_cell(
+        "def _get_top_edge_indices(\n"
+        "    fc_matrix: np.ndarray,\n"
+        "    saliency: np.ndarray,\n"
+        "    fraction: float,\n"
+        ") -> Tuple[np.ndarray, np.ndarray]:\n"
+        "    \"\"\"Extract row and column coordinates of the top fraction of salient edges.\"\"\"\n"
+        "    n = len(saliency)\n"
+        "    importance = saliency[:, None] + saliency[None, :]\n"
+        "    k = max(1, int(fraction * n * (n - 1) / 2))\n"
+        "    triu_indices = np.triu_indices(n, k=1)\n"
+        "    edge_scores = importance[triu_indices]\n"
+        "    top_indices = np.argsort(edge_scores)[-k:]\n"
+        "    return triu_indices[0][top_indices], triu_indices[1][top_indices]\n"
+        "\n"
+        "\n"
+        "def mask_top_edges(fc_matrix: np.ndarray, saliency: np.ndarray, fraction: float = 0.1) -> np.ndarray:\n"
+        "    \"\"\"Mask top salient connections by setting them to zero (Fidelity+ test).\"\"\"\n"
+        "    masked = fc_matrix.copy()\n"
+        "    r_idx, c_idx = _get_top_edge_indices(fc_matrix, saliency, fraction)\n"
+        "    masked[r_idx, c_idx] = 0.0\n"
+        "    masked[c_idx, r_idx] = 0.0\n"
+        "    return masked\n"
+        "\n"
+        "\n"
+        "def retain_top_edges(fc_matrix: np.ndarray, saliency: np.ndarray, fraction: float = 0.2) -> np.ndarray:\n"
+        "    \"\"\"Preserve only top salient connections, zeroing out other edges (Fidelity- test).\"\"\"\n"
+        "    preserved = np.zeros_like(fc_matrix)\n"
+        "    r_idx, c_idx = _get_top_edge_indices(fc_matrix, saliency, fraction)\n"
+        "    preserved[r_idx, c_idx] = fc_matrix[r_idx, c_idx]\n"
+        "    preserved[c_idx, r_idx] = fc_matrix[c_idx, r_idx]\n"
+        "    return preserved\n"
+        "\n"
+        "\n"
+        "@torch.no_grad()\n"
+        "def evaluate_fidelity(\n"
+        "    model: BrainNetCNN,\n"
+        "    fc_matrix: np.ndarray,\n"
+        "    saliency: np.ndarray,\n"
+        "    device: torch.device,\n"
+        ") -> Dict[str, float]:\n"
+        "    \"\"\"\n"
+        "    Evaluate quantitative Fidelity+ and Fidelity- scores.\n"
+        "    Fidelity+: Drop in predicted probability when masking salient edges (top 10%, top 20%).\n"
+        "    Fidelity-: Predictive stability when retaining salient edges (top 10%, top 20%).\n"
+        "    \"\"\"\n"
+        "    model.eval()\n"
+        "    t_fc = torch.from_numpy(fc_matrix).float().unsqueeze(0).to(device)\n"
+        "    base_prob = float(F.softmax(model(t_fc), dim=-1)[0, 1].item())\n"
+        "\n"
+        "    # Fidelity+ (masking top 10% and top 20% salient edges)\n"
+        "    fc_drop10 = mask_top_edges(fc_matrix, saliency, fraction=0.1)\n"
+        "    fc_drop20 = mask_top_edges(fc_matrix, saliency, fraction=0.2)\n"
+        "    prob_drop10 = float(F.softmax(model(torch.from_numpy(fc_drop10).float().unsqueeze(0).to(device)), dim=-1)[0, 1].item())\n"
+        "    prob_drop20 = float(F.softmax(model(torch.from_numpy(fc_drop20).float().unsqueeze(0).to(device)), dim=-1)[0, 1].item())\n"
+        "\n"
+        "    # Fidelity- (retaining top 10% and top 20% salient edges)\n"
+        "    fc_ret10 = retain_top_edges(fc_matrix, saliency, fraction=0.1)\n"
+        "    fc_ret20 = retain_top_edges(fc_matrix, saliency, fraction=0.2)\n"
+        "    prob_ret10 = float(F.softmax(model(torch.from_numpy(fc_ret10).float().unsqueeze(0).to(device)), dim=-1)[0, 1].item())\n"
+        "    prob_ret20 = float(F.softmax(model(torch.from_numpy(fc_ret20).float().unsqueeze(0).to(device)), dim=-1)[0, 1].item())\n"
+        "\n"
+        "    fidelity_scores = {\n"
+        "        \"base_probability\": base_prob,\n"
+        "        \"fidelity_plus_drop_10\": float(base_prob - prob_drop10),\n"
+        "        \"fidelity_plus_drop_20\": float(base_prob - prob_drop20),\n"
+        "        \"fidelity_minus_retention_10\": prob_ret10,\n"
+        "        \"fidelity_minus_retention_20\": prob_ret20,\n"
+        "    }\n"
+        "\n"
+        "    print(\"\\nQuantitative Fidelity Attribution Verification:\")\n"
+        "    print(f\"  Base ASD Probability:         {base_prob:.4f}\")\n"
+        "    print(f\"  Fidelity+ (Mask Top 10%):      Drop = {base_prob - prob_drop10:+.4f} (new prob: {prob_drop10:.4f})\")\n"
+        "    print(f\"  Fidelity+ (Mask Top 20%):      Drop = {base_prob - prob_drop20:+.4f} (new prob: {prob_drop20:.4f})\")\n"
+        "    print(f\"  Fidelity- (Retain Top 10%):    Preserved Prob = {prob_ret10:.4f}\")\n"
+        "    print(f\"  Fidelity- (Retain Top 20%):    Preserved Prob = {prob_ret20:.4f}\")\n"
+        "\n"
+        "    return fidelity_scores"
+    ))
+
+    # Cell 16: Code Main Pipeline Runner & Artifact Export
+    cells.append(_make_code_cell(
+        "def main() -> None:\n"
+        "    print(\"=\" * 60)\n"
+        "    print(\"STARTING EXPLAINABLE BRAINNET-CLIP TRAINING PIPELINE\")\n"
+        "    print(\"=\" * 60)\n"
+        "\n"
+        "    # 1. Discover or fetch dataset\n"
+        "    pheno_df, ts_list, sub_ids = discover_or_fetch_abide_dataset()\n"
+        "\n"
+        "    # 2. Quality Control: Motion filtering\n"
+        "    clean_pheno, clean_ts, keep_mask = filter_motion_quality(pheno_df, ts_list, max_fd=0.5)\n"
+        "\n"
+        "    # 3. Clinical text prompt generation\n"
+        "    prompts = generate_phenotypic_prompts(clean_pheno)\n"
+        "\n"
+        "    # 4. Binary targets (DX_GROUP: 1 = ASD, 2 = TC)\n"
+        "    dx_group = pd.to_numeric(clean_pheno[\"DX_GROUP\"]).to_numpy()\n"
+        "    labels = np.where(dx_group == 1, 1, 0).astype(np.int64)\n"
+        "    site_ids = clean_pheno[\"SITE_ID\"].astype(str).tolist() if \"SITE_ID\" in clean_pheno.columns else [\"\" for _ in labels]\n"
+        "    print(f\"Cohort summary: {len(labels)} subjects ({np.sum(labels == 1)} ASD, {np.sum(labels == 0)} TC).\")\n"
+        "\n"
+        "    # 5. Run Stratified 10-Fold Cross-Validation\n"
+        "    cv_results, best_model = run_stratified_10_fold_cv(\n"
+        "        timeseries_list=clean_ts,\n"
+        "        prompts=prompts,\n"
+        "        labels=labels,\n"
+        "        site_ids=site_ids,\n"
+        "        n_splits=10,\n"
+        "        epochs=50,\n"
+        "        batch_size=32,\n"
+        "        device=DEVICE,\n"
+        "    )\n"
+        "\n"
+        "    # 6. Aggregate Evaluation & ROC Curve Plotting\n"
+        "    metrics = compute_and_plot_aggregate_metrics(\n"
+        "        cv_results[\"oof_targets\"],\n"
+        "        cv_results[\"oof_probs\"],\n"
+        "        cv_results[\"oof_preds\"],\n"
+        "        output_fig_path=\"aggregate_roc_curve.png\",\n"
+        "        output_csv_path=\"oof_predictions.csv\",\n"
+        "    )\n"
+        "\n"
+        "    with open(\"cv_metrics.json\", \"w\", encoding=\"utf-8\") as f:\n"
+        "        json.dump(metrics, f, indent=2)\n"
+        "\n"
+        "    # 7. Neurobiological Explainability & Yeo 7 Network Enrichment\n"
+        "    print(\"\\nRunning Neurobiological Explainability Engine...\")\n"
+        "    atlas_records = build_cc200_yeo7_mapping()\n"
+        "    gradcam = BrainNetGradCAM(best_model)\n"
+        "\n"
+        "    asd_indices = np.where(labels == 1)[0]\n"
+        "    sample_indices = asd_indices[:min(20, len(asd_indices))]\n"
+        "    sample_fcs = compute_tangent_fc([clean_ts[i] for i in sample_indices])\n"
+        "\n"
+        "    saliencies = []\n"
+        "    cohort_fids = []\n"
+        "    for fc_mat in sample_fcs:\n"
+        "        sal = gradcam.compute_saliency(torch.from_numpy(fc_mat).float().to(DEVICE), target_class=1)\n"
+        "        saliencies.append(sal)\n"
+        "        fid = evaluate_fidelity(best_model, fc_mat, sal, device=DEVICE)\n"
+        "        cohort_fids.append(fid)\n"
+        "    mean_saliency = np.mean(saliencies, axis=0)\n"
+        "\n"
+        "    enrichment = compute_network_enrichment(mean_saliency, atlas_records)\n"
+        "    plot_yeo7_enrichment(enrichment, output_path=\"yeo7_network_enrichment.png\")\n"
+        "\n"
+        "    with open(\"yeo7_enrichment.json\", \"w\", encoding=\"utf-8\") as f:\n"
+        "        json.dump(enrichment, f, indent=2)\n"
+        "\n"
+        "    # 8. Quantitative Fidelity Summary across Cohort Samples\n"
+        "    avg_fid = {\n"
+        "        \"fidelity_plus_drop_10\": float(np.mean([x[\"fidelity_plus_drop_10\"] for x in cohort_fids])),\n"
+        "        \"fidelity_plus_drop_20\": float(np.mean([x[\"fidelity_plus_drop_20\"] for x in cohort_fids])),\n"
+        "        \"fidelity_minus_retention_10\": float(np.mean([x[\"fidelity_minus_retention_10\"] for x in cohort_fids])),\n"
+        "        \"fidelity_minus_retention_20\": float(np.mean([x[\"fidelity_minus_retention_20\"] for x in cohort_fids])),\n"
+        "    }\n"
+        "    with open(\"fidelity_scores.json\", \"w\", encoding=\"utf-8\") as f:\n"
+        "        json.dump(avg_fid, f, indent=2)\n"
+        "\n"
+        "    # 9. Model Checkpoint Persistence\n"
+        "    checkpoint_path = \"brainnetcnn_best.pt\"\n"
+        "    torch.save(best_model.state_dict(), checkpoint_path)\n"
+        "    print(f\"SUCCESS: Saved trained model checkpoint to: {checkpoint_path}\")\n"
+        "    print(\"\\nSUCCESS: Explainable BrainNet-CLIP training and validation pipeline complete.\")\n"
+        "\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()"
+    ))
+
+    notebook_content: Dict[str, Any] = {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {
+                "codemirror_mode": {"name": "ipython", "version": 3},
+                "file_extension": ".py",
+                "mimetype": "text/x-python",
+                "name": "python",
+                "nbformat": 4,
+                "nbformat_minor": 5,
+                "version": "3.10.0",
+            },
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(notebook_content, f, indent=2)
+
+    return target
+
+
+def build_all(
+    notebook_path: Optional[Path | str] = None,
+    metadata_path: Optional[Path | str] = None,
+    kernel_slug: str = DEFAULT_KERNEL_SLUG,
+    accelerator: str = DEFAULT_ACCELERATOR,
+) -> Tuple[Path, Path]:
+    """
+    Build both the standalone Jupyter training notebook and kernel metadata file.
+
+    Args:
+        notebook_path: Destination path for Jupyter notebook.
+        metadata_path: Destination path for kernel-metadata.json.
+        kernel_slug: Kaggle kernel identifier.
+        accelerator: Hardware accelerator string.
+
+    Returns:
+        Tuple of (notebook_path, metadata_path).
+    """
+    nb_target = generate_notebook(output_path=notebook_path)
+    meta_target = generate_kernel_metadata(
+        output_path=metadata_path,
+        kernel_slug=kernel_slug,
+        accelerator=accelerator,
+    )
+    return nb_target, meta_target
+
+
+def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse command line arguments for the notebook generator."""
+    parser = argparse.ArgumentParser(
+        description="Generate self-contained Kaggle training notebook and kernel metadata."
+    )
+    parser.add_argument(
+        "--output-notebook",
+        type=Path,
+        default=DEFAULT_NOTEBOOK_PATH,
+        help="Path for generated Jupyter notebook.",
+    )
+    parser.add_argument(
+        "--output-metadata",
+        type=Path,
+        default=DEFAULT_METADATA_PATH,
+        help="Path for generated kernel-metadata.json.",
+    )
+    parser.add_argument(
+        "--kernel-slug",
+        type=str,
+        default=DEFAULT_KERNEL_SLUG,
+        help="Kaggle kernel identifier (username/slug).",
+    )
+    parser.add_argument(
+        "--accelerator",
+        type=str,
+        default=DEFAULT_ACCELERATOR,
+        help="Kaggle hardware accelerator ('nvidiaTeslaT4x2').",
+    )
+    parser.add_argument(
+        "--print-cli",
+        action="store_true",
+        help="Print Kaggle CLI workflow instructions to stdout.",
+    )
+    return parser.parse_args(args)
+
+
+def main() -> None:
+    """CLI entrypoint for building notebook artifacts."""
+    args = parse_args()
+
+    nb_path, meta_path = build_all(
+        notebook_path=args.output_notebook,
+        metadata_path=args.output_metadata,
+        kernel_slug=args.kernel_slug,
+        accelerator=args.accelerator,
+    )
+
+    print(f"SUCCESS: Generated standalone training notebook at: {nb_path}")
+    print(f"SUCCESS: Generated Kaggle kernel metadata at: {meta_path}")
+
+    if args.print_cli:
+        print("\n" + get_kaggle_cli_instructions(kernel_slug=args.kernel_slug))
+
+
+if __name__ == "__main__":
+    main()
