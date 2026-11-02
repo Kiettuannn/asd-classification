@@ -160,6 +160,8 @@ def test_notebook_contains_all_required_pipeline_components(tmp_path: Path) -> N
     all_code = "\n".join("".join(c.get("source", [])) for c in nb_data["cells"] if c.get("cell_type") == "code")
 
     required_keywords = [
+        "log_msg",
+        "training_progress.log",
         "discover_or_fetch_abide_dataset",
         "filter_motion_quality",
         "generate_phenotypic_prompts",
