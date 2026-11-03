@@ -20,6 +20,7 @@ __pycache__/
 *.nii.gz
 *.1D
 *.part
+*.log
 data/ABIDE_pcp/
 notebooks/data/
 notebooks/abide_data/

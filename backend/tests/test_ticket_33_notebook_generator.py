@@ -277,6 +277,16 @@ def test_notebook_components_execution_on_synthetic_data(tmp_path: Path) -> None
     assert len(prompts) == 3
     assert "12.5-year-old male" in prompts[0]
 
+    # 1b. Verify accelerated covariance precomputation and Tangent FC projection
+    precompute_covs_fn = namespace["precompute_subject_covariances"]
+    covs = precompute_covs_fn(clean_ts)
+    assert covs.shape == (3, 200, 200)
+
+    tangent_fn = namespace["compute_tangent_fc"]
+    tangent_fc = tangent_fn(covariances=covs, fit_indices=[0, 1], device=torch.device("cpu"))
+    assert tangent_fc.shape == (3, 200, 200)
+    assert not np.isnan(tangent_fc).any()
+
     # 2. Verify BrainNetCNN forward pass
     BrainNetCNN = namespace["BrainNetCNN"]
     brain_net = BrainNetCNN(num_rois=200, embed_dim=128, num_classes=2)
