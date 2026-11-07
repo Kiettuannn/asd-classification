@@ -1,0 +1,16 @@
+{
+  "id": "kiettuan/06-braingnn-asd-classification",
+  "title": "06 BrainGNN ASD Classification",
+  "code_file": "braingnn-asd-classification.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": [],
+  "accelerator": "nvidiaTeslaT4x2"
+}
